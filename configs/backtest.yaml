@@ -1,0 +1,17 @@
+window_L: 256
+
+walk_forward:
+  mode: "yearly"
+  first_train_year: 2006
+  first_test_year: 2013        # gives enough warmup before first test
+  last_test_year: null         # null => up to last full year available
+
+  # For each test year Y:
+  # train = [2006 .. Y-2], calibrate = [Y-1], test = [Y]
+  calibration_years: 1
+
+  purge_days: 256              # purge overlap with L
+  embargo_days: 5              # small gap to reduce boundary leakage
+targets:
+  horizons: [1]                # start with t+1 only
+quantiles: [0.05, 0.10, 0.50, 0.90, 0.95]

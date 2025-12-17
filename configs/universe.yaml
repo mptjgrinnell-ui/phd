@@ -1,0 +1,34 @@
+name: oracle_range_v1
+start: "2006-01-01"
+end: null  # null => today
+bar: "1d"
+
+fixed:
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - "^VIX"
+  - XLB
+  - XLC
+  - XLE
+  - XLF
+  - XLI
+  - XLK
+  - XLP
+  - XLRE
+  - XLU
+  - XLV
+  - XLY
+
+# This file will be created by scripts/build_universe.py
+equities_file: "data/meta/equities_top200.txt"
+
+# Yahoo quirks: map tickers containing "." to "-"
+ticker_normalization:
+  replace_dot_with_dash: true
+
+filters:
+  min_history_days: 4500        # roughly >= 18y trading days (guardrail)
+  max_missing_frac: 0.02        # reject if too many missing bars
+  require_ohlcv: true

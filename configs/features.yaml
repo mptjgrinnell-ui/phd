@@ -1,0 +1,31 @@
+panel_in: "data/processed/panel_minimal.parquet"
+panel_out: "data/processed/panel_features_v1.parquet"
+
+lookbacks:
+  returns: [1, 2, 3, 5, 10, 21, 63, 126, 252]
+  vol_windows: [10, 21, 63]
+  z_windows: [21, 63]
+
+context_tickers:
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - "^VIX"
+  - XLF
+  - XLK
+  - XLE
+  - XLV
+  - XLY
+  - XLP
+  - XLI
+  - XLU
+  - XLRE
+  - XLB
+  - XLC
+
+# For baselines, start without context-all-to-all blowup:
+# we'll add only SPY and VIX features to every ticker first.
+broadcast_context:
+  - SPY
+  - "^VIX"
