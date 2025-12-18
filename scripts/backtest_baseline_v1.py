@@ -73,6 +73,8 @@ class ProgressReporter:
                 f"[progress] {pct:5.1f}% ({s['i']}/{total})  Y={ytxt}  phase={s['phase']}  "
                 f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
                 f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}"
+                ,
+                flush=True,
             )
 
 
@@ -134,9 +136,9 @@ def load_or_make_split_indices(years_arr, test_year, cache_dir=SPLIT_CACHE_DIR):
     return tr, cal, te
 
 
-def load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, cache_dir=PREP_CACHE_DIR):
+def load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, split_sig, cache_dir=PREP_CACHE_DIR):
     ensure_dir(cache_dir)
-    fp = os.path.join(cache_dir, f"prep_{feat_sig}_Y{Y}.npz")
+    fp = os.path.join(cache_dir, f"prep_{feat_sig}_{split_sig}_Y{Y}.npz")
     if os.path.exists(fp):
         z = np.load(fp)
         return z["Xtr"], z["Xcal"], z["Xte"]
@@ -237,6 +239,10 @@ def main():
             print(f"Dropped {dropped} constant cols; remaining={len(feat_cols)}")
 
     feat_sig = hashlib.sha1(("|".join(feat_cols)).encode("utf-8")).hexdigest()[:10]
+    uniq_tickers = np.unique(tickers_arr)
+    split_sig = hashlib.sha1(
+        ("|".join(uniq_tickers.tolist()) + f"|{years_arr.min()}|{years_arr.max()}|{len(years_arr)}").encode("utf-8")
+    ).hexdigest()[:10]
 
     # Proxies for Mondrian bucketing (precompute once, if available).
     proxy_vix_absret1 = None
@@ -260,12 +266,9 @@ def main():
     # early years when sampling tickers with limited history.
     years_to_run = []
     for Y in candidate_years:
-        if args.cache_splits:
-            tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y)
-        else:
-            tr_idx = np.flatnonzero(years_arr <= (Y - 2))
-            cal_idx = np.flatnonzero(years_arr == (Y - 1))
-            te_idx = np.flatnonzero(years_arr == Y)
+        tr_idx = np.flatnonzero(years_arr <= (Y - 2))
+        cal_idx = np.flatnonzero(years_arr == (Y - 1))
+        te_idx = np.flatnonzero(years_arr == Y)
         if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
             years_to_run.append(Y)
 
@@ -280,7 +283,7 @@ def main():
     try:
         if not years_to_run:
             progress.update(phase="no_valid_years")
-            print("No valid walk-forward slices produced; check data coverage.")
+            print("No valid walk-forward slices produced; check data coverage.", flush=True)
             return
         for i, Y in enumerate(years_to_run, start=1):
             train_end = Y - 2
@@ -289,7 +292,8 @@ def main():
             progress.update(i=i, year=Y, phase="split")
 
             if args.cache_splits:
-                tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y)
+                split_cache_dir = os.path.join(SPLIT_CACHE_DIR, split_sig)
+                tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y, cache_dir=split_cache_dir)
             else:
                 tr_idx = np.flatnonzero(years_arr <= train_end)
                 cal_idx = np.flatnonzero(years_arr == cal_year)
@@ -298,6 +302,14 @@ def main():
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
             if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
                 progress.update(phase="skip_small")
+                ntr_t = int(np.unique(tickers_arr[tr_idx]).size) if len(tr_idx) else 0
+                ncal_t = int(np.unique(tickers_arr[cal_idx]).size) if len(cal_idx) else 0
+                nte_t = int(np.unique(tickers_arr[te_idx]).size) if len(te_idx) else 0
+                print(
+                    f"SKIP Y={Y} rows tr/cal/te={len(tr_idx)}/{len(cal_idx)}/{len(te_idx)} "
+                    f"tickers tr/cal/te={ntr_t}/{ncal_t}/{nte_t}",
+                    flush=True,
+                )
                 continue
 
             t0 = time.perf_counter()
@@ -310,7 +322,7 @@ def main():
             imputer = SimpleImputer(strategy="median")
             scaler = make_scaler()
             if args.cache_prep:
-                Xtr, Xcal, Xte = load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig)
+                Xtr, Xcal, Xte = load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, split_sig)
             else:
                 Xtr_imp = imputer.fit_transform(Xtr)
                 Xcal_imp = imputer.transform(Xcal)
@@ -446,6 +458,8 @@ def main():
                 f"Y={Y}  MAE(med)={mae:.6f}  cov90={cov90:.3f}  cov95={cov95:.3f}  "
                 f"exc05={exc05:.3f}  exc95={exc95:.3f}  rows(tr/cal/te)={len(tr_idx)}/{len(cal_idx)}/{len(te_idx)}  "
                 f"secs={dt:.1f}  jobs={q_jobs}/{args.parallel_backend}"
+                ,
+                flush=True,
             )
 
             processed += 1
