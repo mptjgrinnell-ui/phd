@@ -6,6 +6,7 @@ import pandas as pd
 import yaml
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
@@ -155,9 +156,19 @@ def main():
         )
         q_models = dict(q_pairs)
 
-        # Direction model (up/down)
+        # Direction model (up/down) + calibration on the calibration year
         ytr_up = (ytr > 0).astype(int)
-        clf = LogisticRegression(max_iter=200, n_jobs=1)
+        ycal_up = (ycal > 0).astype(int)
+
+        clf = LogisticRegression(
+            solver="saga",
+            penalty="l2",
+            C=1.0,
+            max_iter=2000,
+            tol=1e-4,
+            n_jobs=-1,
+            random_state=42,
+        )
         clf.fit(Xtr, ytr_up)
 
         # Predict on calibration for normalized conformal
@@ -219,7 +230,15 @@ def main():
 
         # Predict on test
         preds = {q: q_models[q].predict(Xte) for q in Q_LIST}
-        pup = clf.predict_proba(Xte)[:, 1]
+
+        # Calibrate probabilities using the calibration year (Platt/sigmoid).
+        # Guard against tiny samples where calibration labels collapse to 1 class.
+        if np.unique(ycal_up).size >= 2:
+            cal_clf = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
+            cal_clf.fit(Xcal, ycal_up)
+            pup = cal_clf.predict_proba(Xte)[:, 1]
+        else:
+            pup = clf.predict_proba(Xte)[:, 1]
 
         te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
         te_bucket = bucketize(te_proxy, edges)
