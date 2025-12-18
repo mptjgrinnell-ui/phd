@@ -49,6 +49,8 @@ class ProgressReporter:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._last_print_key = None
+        self._last_print_ts = 0.0
         self._state = {
             "phase": "init",
             "year": None,
@@ -62,6 +64,7 @@ class ProgressReporter:
             "rows_te": 0,
             "cum_test_rows": 0,
             "start_ts": time.time(),
+            "year_start_ts": time.time(),
             "last_event_ts": time.time(),
             "spin_i": 0,
         }
@@ -137,7 +140,12 @@ class ProgressReporter:
         now = time.time()
         elapsed = max(1e-6, now - s["start_ts"])
         since_evt = max(0.0, now - float(s.get("last_event_ts", s["start_ts"])))
-        rows_rate = s["cum_test_rows"] / elapsed
+
+        # "cum_test_rows" reflects completed years only; during a year it's still 0.
+        # Show an honest per-year rate using the known test-set size for the year.
+        year_elapsed = max(1e-6, now - float(s.get("year_start_ts", s["start_ts"])))
+        year_te_rows = int(s.get("rows_te", 0))
+        year_rows_rate = year_te_rows / year_elapsed
         y = s["year"]
         ytxt = "?" if y is None else str(y)
         subtxt = ""
@@ -147,20 +155,53 @@ class ProgressReporter:
             f"{spin} [progress] {pct:5.1f}% (year {min(max(year_i, 0), total_years)}/{total_years})  "
             f"Y={ytxt}  phase={s['phase']}{subtxt}  "
             f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
-            f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}  "
+            f"cum_te_done={s['cum_test_rows']}  yr_te_rows/s={year_rows_rate:,.1f}  "
             f"t={elapsed:,.0f}s  idle={since_evt:,.0f}s"
         )
 
     def print_now(self):
         s = self._snapshot()
         spin = self._next_spin(s)
-        print(self._format_line(s, spin), flush=True)
+        line = self._format_line(s, spin)
+        with self._lock:
+            self._last_print_key = (
+                s.get("i"),
+                s.get("year"),
+                s.get("phase"),
+                s.get("sub_done"),
+                s.get("sub_total"),
+                s.get("rows_tr"),
+                s.get("rows_cal"),
+                s.get("rows_te"),
+                s.get("cum_test_rows"),
+            )
+            self._last_print_ts = time.time()
+        print(line, flush=True)
 
     def _run(self):
         while not self._stop.wait(self.every_sec):
             s = self._snapshot()
-            spin = self._next_spin(s)
-            print(self._format_line(s, spin), flush=True)
+            key = (
+                s.get("i"),
+                s.get("year"),
+                s.get("phase"),
+                s.get("sub_done"),
+                s.get("sub_total"),
+                s.get("rows_tr"),
+                s.get("rows_cal"),
+                s.get("rows_te"),
+                s.get("cum_test_rows"),
+            )
+            now = time.time()
+            with self._lock:
+                last_key = self._last_print_key
+                last_ts = self._last_print_ts
+
+            # Reduce spam: if nothing changed, print only every ~30s.
+            if key == last_key and (now - last_ts) < 30.0:
+                continue
+
+            self.print_now()
 
 
 def make_year_slices(df, first_test_year, last_test_year):
@@ -426,6 +467,9 @@ def main():
                 )
                 continue
 
+            t_year_start = time.time()
+            progress.update(year_start_ts=t_year_start, event=True)
+
             t0 = time.perf_counter()
             Xtr, ytr = X_all[tr_idx], y_all[tr_idx]
             Xcal, ycal = X_all[cal_idx], y_all[cal_idx]
@@ -604,18 +648,20 @@ def main():
             cov95 = np.mean((yte >= conf_bands["conf95_lo"]) & (yte <= conf_bands["conf95_hi"]))
             exc05 = np.mean(yte < preds[0.05])
             exc95 = np.mean(yte > preds[0.95])
+            cum_test_rows += len(te_idx)
+            secs = time.time() - t_year_start
+            te_rows_s = len(te_idx) / max(secs, 1e-9)
             dt = time.perf_counter() - t0
             print(
                 f"Y={Y}  MAE(med)={mae:.6f}  cov90={cov90:.3f}  cov95={cov95:.3f}  "
                 f"exc05={exc05:.3f}  exc95={exc95:.3f}  rows(tr/cal/te)={len(tr_idx)}/{len(cal_idx)}/{len(te_idx)}  "
-                f"secs={dt:.1f}  jobs={q_jobs}/{args.parallel_backend}"
+                f"secs={secs:.1f}  te_rows/s={te_rows_s:.1f}  jobs={q_jobs}/{args.parallel_backend}"
                 ,
                 flush=True,
             )
 
             processed += 1
-            cum_test_rows += len(te_idx)
-            progress.update(phase="done_year", cum_test_rows=cum_test_rows)
+            progress.update(phase="done_year", cum_test_rows=cum_test_rows, event=True)
 
         progress.update(phase="done_all", cum_test_rows=cum_test_rows)
     finally:
