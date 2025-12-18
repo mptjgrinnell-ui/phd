@@ -16,3 +16,8 @@ data/meta/prep_cache_v*/
 # Run logs
 log/*.txt
 log/.ipynb_checkpoints/
+
+# Local backups (one-file SQLite)
+backup/*.db
+backup/*.db-wal
+backup/*.db-shm

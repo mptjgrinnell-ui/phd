@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# Snapshot working tree into local one-file backup after each git commit.
+# This is local-only; the resulting backup DB is gitignored.
+
+ROOT="$(git rev-parse --show-toplevel)"
+DB="$ROOT/backup/backup.db"
+MSG="$(git log -1 --pretty=%s)"
+
+python "$ROOT/scripts/backup_db.py" --db "$DB" snapshot -m "$MSG" >/dev/null 2>&1 || true
+
