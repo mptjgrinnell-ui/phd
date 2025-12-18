@@ -3,6 +3,7 @@ import argparse
 import time
 import hashlib
 import threading
+import concurrent.futures
 import numpy as np
 import pandas as pd
 import yaml
@@ -25,6 +26,21 @@ MIN_TEST_ROWS = 1000
 
 
 class ProgressReporter:
+    PHASE_STEPS = 6
+    PHASE_TO_STEP = {
+        "init": 0,
+        "split": 0,
+        "prep": 1,
+        "fit_quantiles": 2,
+        "fit_direction": 3,
+        "calibrate_conformal": 4,
+        "predict": 5,
+        "skip_small": PHASE_STEPS,
+        "done_year": PHASE_STEPS,
+        "done_all": PHASE_STEPS,
+        "no_valid_years": 0,
+    }
+
     def __init__(self, total, every_sec: float = 5.0):
         self.total = int(total)
         self.every_sec = float(every_sec)
@@ -35,7 +51,9 @@ class ProgressReporter:
             "phase": "init",
             "year": None,
             "i": 0,
-            "done": 0,
+            "phase_step": 0,
+            "q_done": 0,
+            "q_total": 0,
             "rows_tr": 0,
             "rows_cal": 0,
             "rows_te": 0,
@@ -54,6 +72,15 @@ class ProgressReporter:
 
     def update(self, **kwargs):
         with self._lock:
+            if "phase" in kwargs and "phase_step" not in kwargs:
+                phase = kwargs["phase"]
+                kwargs["phase_step"] = self.PHASE_TO_STEP.get(phase, 0)
+                if phase == "fit_quantiles":
+                    kwargs.setdefault("q_total", len(Q_LIST))
+                    kwargs.setdefault("q_done", 0)
+                else:
+                    kwargs.setdefault("q_total", 0)
+                    kwargs.setdefault("q_done", 0)
             self._state.update(kwargs)
 
     def _snapshot(self):
@@ -63,14 +90,32 @@ class ProgressReporter:
     def _run(self):
         while not self._stop.wait(self.every_sec):
             s = self._snapshot()
-            total = max(self.total, 1)
-            pct = 100.0 * (s["i"] / total)
+            total_years = max(self.total, 1)
+            year_i = int(s.get("i", 0))
+            years_done = min(max(year_i - 1, 0), total_years)
+
+            phase_step = int(s.get("phase_step", 0))
+            phase_step = min(max(phase_step, 0), self.PHASE_STEPS)
+
+            q_total = int(s.get("q_total", 0))
+            q_done = int(s.get("q_done", 0))
+            if q_total > 0:
+                sub_frac = min(max(q_done / max(q_total, 1), 0.0), 1.0)
+            else:
+                sub_frac = 0.0
+
+            year_frac = min(max((phase_step + sub_frac) / max(self.PHASE_STEPS, 1), 0.0), 1.0)
+            pct = 100.0 * ((years_done + year_frac) / total_years)
             elapsed = max(1e-6, time.time() - s["start_ts"])
             rows_rate = s["cum_test_rows"] / elapsed
             y = s["year"]
             ytxt = "?" if y is None else str(y)
+            qtxt = ""
+            if s.get("phase") == "fit_quantiles" and q_total > 0:
+                qtxt = f"  q={q_done}/{q_total}"
             print(
-                f"[progress] {pct:5.1f}% ({s['i']}/{total})  Y={ytxt}  phase={s['phase']}  "
+                f"[progress] {pct:5.1f}% (year {min(max(year_i, 0), total_years)}/{total_years})  "
+                f"Y={ytxt}  phase={s['phase']}{qtxt}  "
                 f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
                 f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}"
                 ,
@@ -364,9 +409,19 @@ def main():
             progress.update(phase="fit_quantiles")
             # Quantile models
             q_jobs = min(max(1, int(args.n_jobs)), len(Q_LIST))
-            q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
-                delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
-            )
+            if args.parallel_backend == "threading":
+                progress.update(q_done=0, q_total=len(Q_LIST))
+                q_pairs = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=q_jobs) as ex:
+                    futures = [ex.submit(fit_one_quantile, q, Xtr, ytr) for q in Q_LIST]
+                    for k, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
+                        q_pairs.append(fut.result())
+                        progress.update(q_done=k, q_total=len(Q_LIST))
+            else:
+                q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
+                    delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
+                )
+                progress.update(q_done=len(Q_LIST), q_total=len(Q_LIST))
             q_models = dict(q_pairs)
 
             progress.update(phase="fit_direction")
