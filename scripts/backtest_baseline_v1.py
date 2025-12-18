@@ -465,6 +465,24 @@ def parse_args():
         default=5.0,
         help="Print a progress heartbeat every N seconds (0 disables).",
     )
+    p.add_argument(
+        "--first-test-year",
+        type=int,
+        default=None,
+        help="Override configs/backtest.yaml walk_forward.first_test_year",
+    )
+    p.add_argument(
+        "--last-test-year",
+        type=int,
+        default=None,
+        help="Override configs/backtest.yaml walk_forward.last_test_year",
+    )
+    p.add_argument(
+        "--min-panel-year",
+        type=int,
+        default=None,
+        help="If set, drop panel rows with Date.year < this to reduce IO/RAM (debug speedup).",
+    )
     return p.parse_args()
 
 
@@ -484,6 +502,11 @@ def main():
     panel["Date"] = pd.to_datetime(panel["Date"])
     panel = panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     panel = panel.dropna(axis=1, how="all")
+
+    if args.min_panel_year is not None:
+        min_y = int(args.min_panel_year)
+        panel = panel.loc[panel["Date"].dt.year >= min_y].copy()
+        print(f"[data-cut] kept rows with Date.year >= {min_y}. rows={len(panel):,}")
 
     drop = {"Date", "Ticker", "r_t1"}
     feat_cols = [c for c in panel.columns if c not in drop]
@@ -555,8 +578,18 @@ def main():
     if "range_std_21" in panel.columns:
         proxy_own_range_std21 = panel["range_std_21"].to_numpy(dtype=np.float32, copy=False)
 
-    first_test_year = bcfg["walk_forward"]["first_test_year"]
-    last_test_year = bcfg["walk_forward"]["last_test_year"]
+    first_test_year = (
+        int(args.first_test_year)
+        if args.first_test_year is not None
+        else int(bcfg["walk_forward"]["first_test_year"])
+    )
+    last_test_year = (
+        int(args.last_test_year)
+        if args.last_test_year is not None
+        else int(bcfg["walk_forward"]["last_test_year"])
+    )
+    if last_test_year is not None and first_test_year > last_test_year:
+        raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
 
     tape_rows = []
 
