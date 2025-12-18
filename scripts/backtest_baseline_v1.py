@@ -477,14 +477,20 @@ def parse_args():
     p.add_argument(
         "--cal-years",
         type=int,
-        default=1,
-        help="Number of prior years used for calibration (default 1; try 3 for regime robustness).",
+        default=None,
+        help="Calibration window length in years. For test year Y, calibrate on [Y-cal_years .. Y-1].",
     )
     p.add_argument(
         "--n-buckets",
         type=int,
         default=3,
         help="Mondrian bucket count for conformal conditioning (default 3; try 5).",
+    )
+    p.add_argument(
+        "--regime-buckets",
+        type=int,
+        default=None,
+        help="Number of Mondrian regime buckets for conformal (e.g., 5).",
     )
     p.add_argument(
         "--sigma-proxy",
@@ -628,6 +634,8 @@ def main():
         if args.last_test_year is not None
         else int(bcfg["walk_forward"]["last_test_year"])
     )
+    default_cal_years = int(bcfg["walk_forward"].get("cal_years", 1))
+    cal_years = int(args.cal_years) if args.cal_years is not None else default_cal_years
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
 
@@ -638,9 +646,8 @@ def main():
     # Pre-filter to years that have enough rows for tr/cal/te. This avoids wasting
     # early years when sampling tickers with limited history.
     years_to_run = []
-    cal_years = int(args.cal_years)
     for Y in candidate_years:
-        tr_idx = np.flatnonzero(years_arr <= (Y - cal_years - 1))
+        tr_idx = np.flatnonzero(years_arr < (Y - cal_years))
         cal_idx = np.flatnonzero((years_arr >= (Y - cal_years)) & (years_arr <= (Y - 1)))
         te_idx = np.flatnonzero(years_arr == Y)
         if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
@@ -662,7 +669,6 @@ def main():
             print("No valid walk-forward slices produced; check data coverage.", flush=True)
             return
         for i, Y in enumerate(years_to_run, start=1):
-            train_end = Y - cal_years - 1
             cal_year_start = Y - cal_years
             cal_year_end = Y - 1
             test_year = Y
@@ -674,7 +680,7 @@ def main():
                     years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
                 )
             else:
-                tr_idx = np.flatnonzero(years_arr <= train_end)
+                tr_idx = np.flatnonzero(years_arr < cal_year_start)
                 cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
                 te_idx = np.flatnonzero(years_arr == test_year)
 
@@ -874,7 +880,32 @@ def main():
                     return None
                 return edges
 
-            edges = make_edges(cal_proxy, n_bins=args.n_buckets)
+            n_buckets_default = int(bcfg.get("conformal", {}).get("n_buckets", 4))
+            n_buckets = int(args.regime_buckets) if args.regime_buckets is not None else int(args.n_buckets or n_buckets_default)
+
+            def make_breaks(proxy_arr, n_bins):
+                if proxy_arr is None:
+                    return None
+                vals = proxy_arr[np.isfinite(proxy_arr)]
+                if vals.size < 200:
+                    return None
+                qs = np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1)[1:-1]
+                breaks = np.quantile(vals, qs)
+                breaks = np.unique(breaks)
+                if breaks.size == 0:
+                    return None
+                return breaks
+
+            def bucketize(arr, breaks, n):
+                if arr is None or breaks is None:
+                    return np.zeros(n, dtype=int)
+                b = np.digitize(arr, breaks, right=True)
+                b = np.where(np.isfinite(arr), b, 0)
+                return b.astype(int)
+
+            breaks = make_breaks(cal_proxy, n_buckets)
+            cal_bucket = bucketize(cal_proxy, breaks, len(cal_s))
+            te_bucket = bucketize(te_proxy, breaks, len(yte))
 
             def bucketize(arr, edges_in, n):
                 if arr is None or edges_in is None:
