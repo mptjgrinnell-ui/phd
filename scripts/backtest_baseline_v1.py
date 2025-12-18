@@ -972,7 +972,7 @@ def main():
             te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
             te_sigma_rv = sigma_rv_arr[te_idx]
             te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=args.sigma_proxy, eps=EPS)
-            te_bucket = bucketize(te_proxy, edges, len(yte))
+            te_bucket = bucketize(te_proxy, breaks, len(yte))
 
             conf_bands = {}
             eta.start()
