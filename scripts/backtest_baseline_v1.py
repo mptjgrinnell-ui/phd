@@ -590,6 +590,7 @@ def main():
     dates_arr = panel["Date"].to_numpy()
     tickers_arr = panel["Ticker"].to_numpy()
     sigma_rv_arr = panel["sigma_rv20"].to_numpy(dtype=np.float32, copy=False)
+    min_year_in_panel = int(np.min(years_arr))
 
     # Feature matrix + target as float32 (faster + less RAM).
     X_all = panel[feat_cols].to_numpy(dtype=np.float32, copy=False)
@@ -676,6 +677,12 @@ def main():
     )
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
+    if args.min_panel_year is not None and args.cal_years is not None:
+        if int(args.min_panel_year) >= (first_test_year - int(args.cal_years)):
+            print(
+                "[warning] min-panel-year is too late for the requested cal-years; training may be empty.",
+                flush=True,
+            )
 
     tape_rows = []
 
@@ -685,9 +692,7 @@ def main():
     # early years when sampling tickers with limited history.
     years_to_run = []
     for Y in candidate_years:
-        tr_idx = np.flatnonzero(years_arr < (Y - cal_years))
-        cal_idx = np.flatnonzero((years_arr >= (Y - cal_years)) & (years_arr <= (Y - 1)))
-        te_idx = np.flatnonzero(years_arr == Y)
+        (tr_idx, cal_idx, te_idx), K_used = safe_split_indices_K(years_arr, Y, cal_years)
         if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
             years_to_run.append(Y)
 
@@ -718,9 +723,7 @@ def main():
                     years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
                 )
             else:
-                tr_idx = np.flatnonzero(years_arr < cal_year_start)
-                cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
-                te_idx = np.flatnonzero(years_arr == test_year)
+                tr_idx, cal_idx, te_idx = split_indices_K(years_arr, Y, cal_years)
 
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
             if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
