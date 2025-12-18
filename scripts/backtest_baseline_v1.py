@@ -22,6 +22,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from joblib import Parallel, delayed
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 Q_LIST = [0.05, 0.10, 0.50, 0.90, 0.95]
 ALPHAS = [0.10, 0.05]  # 90%, 95%
 SPLIT_CACHE_DIR = "data/meta/split_cache_v1"
@@ -413,6 +417,27 @@ def load_or_make_split_indices(years_arr, test_year, cal_years: int = 1, cache_d
     return tr, cal, te
 
 
+def split_indices_K(years_arr: np.ndarray, Y: int, cal_years: int):
+    cal_start = Y - int(cal_years)
+    tr = np.flatnonzero(years_arr < cal_start)
+    cal = np.flatnonzero((years_arr >= cal_start) & (years_arr <= (Y - 1)))
+    te = np.flatnonzero(years_arr == Y)
+    return tr, cal, te
+
+
+def safe_split_indices_K(years_arr: np.ndarray, Y: int, cal_years: int):
+    min_year = int(years_arr.min())
+    max_possible_K = max(1, (Y - 1) - min_year)
+    K_req = max(1, int(cal_years))
+    K_use = min(K_req, max_possible_K)
+    if K_use != K_req:
+        print(
+            f"[warn] Y={Y} requested cal_years={K_req} but only K={K_use} available from data; using K={K_use}.",
+            flush=True,
+        )
+    return split_indices_K(years_arr, Y, K_use), K_use
+
+
 def load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, split_sig, cache_dir=PREP_CACHE_DIR):
     ensure_dir(cache_dir)
     fp = os.path.join(cache_dir, f"prep_{feat_sig}_{split_sig}_Y{Y}.npz")
@@ -607,7 +632,7 @@ def main():
     split_sig = hashlib.sha1(
         (
             "|".join(uniq_tickers.tolist())
-            + f"|{years_arr.min()}|{years_arr.max()}|{len(years_arr)}|cal{int(args.cal_years)}"
+            + f"|{years_arr.min()}|{years_arr.max()}|{len(years_arr)}|cal{int(cal_years)}"
         ).encode("utf-8")
     ).hexdigest()[:10]
 
@@ -642,6 +667,26 @@ def main():
     cal_years = int(args.cal_years) if args.cal_years is not None else default_cal_years
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
+    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
+    n_buckets = (
+        int(args.regime_buckets)
+        if args.regime_buckets is not None
+        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
+    )
+    if cal_years < 1:
+        raise ValueError("--cal-years must be >= 1")
+    if n_buckets < 2:
+        raise ValueError("--regime-buckets must be >= 2")
+    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
+    n_buckets = (
+        int(args.regime_buckets)
+        if args.regime_buckets is not None
+        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
+    )
+    if cal_years < 1:
+        raise ValueError("--cal-years must be >= 1")
+    if n_buckets < 2:
+        raise ValueError("--regime-buckets must be >= 2")
 
     tape_rows = []
 
@@ -877,32 +922,32 @@ def main():
             # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
             cal_s = np.maximum(0.0, np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma)
 
-            n_buckets_default = int(bcfg.get("conformal", {}).get("n_buckets", 4))
-            n_buckets = int(args.regime_buckets) if args.regime_buckets is not None else int(args.n_buckets or n_buckets_default)
+            def make_bucket_edges(cal_proxy_arr: np.ndarray, n_bins: int):
+                if cal_proxy_arr is None:
+                    return np.array([-np.inf, np.inf], dtype=np.float32)
+                m = np.isfinite(cal_proxy_arr)
+                x = cal_proxy_arr[m]
+                if x.size < 50:
+                    return np.array([-np.inf, np.inf], dtype=np.float32)
+                qs = np.linspace(0.0, 1.0, int(n_bins) + 1)
+                edges = np.quantile(x, qs).astype(np.float32)
+                edges = np.unique(edges)
+                if edges.size < 3:
+                    return np.array([-np.inf, np.inf], dtype=np.float32)
+                edges[0] = -np.inf
+                edges[-1] = np.inf
+                return edges
 
-            def make_breaks(proxy_arr, n_bins):
-                if proxy_arr is None:
-                    return None
-                vals = proxy_arr[np.isfinite(proxy_arr)]
-                if vals.size < 200:
-                    return None
-                qs = np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1)[1:-1]
-                breaks = np.quantile(vals, qs)
-                breaks = np.unique(breaks)
-                if breaks.size == 0:
-                    return None
-                return breaks
-
-            def bucketize(arr, breaks, n):
-                if arr is None or breaks is None:
+            def bucketize(arr, edges_arr, n):
+                if arr is None or edges_arr is None:
                     return np.zeros(n, dtype=int)
-                b = np.digitize(arr, breaks, right=True)
+                b = np.digitize(arr, edges_arr[1:-1], right=True)
                 b = np.where(np.isfinite(arr), b, 0)
                 return b.astype(int)
 
-            breaks = make_breaks(cal_proxy, n_buckets)
-            cal_bucket = bucketize(cal_proxy, breaks, len(cal_s))
-            te_bucket = bucketize(te_proxy, breaks, len(yte))
+            edges = make_bucket_edges(cal_proxy, n_buckets)
+            cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
+            te_bucket = bucketize(te_proxy, edges, len(yte))
 
             # Global fallback quantiles (CQR score).
             qhat_global = {alpha: conformal_qhat(cal_s, alpha) for alpha in ALPHAS}
