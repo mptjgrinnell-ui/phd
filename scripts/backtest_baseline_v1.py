@@ -387,22 +387,22 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
-def load_or_make_split_indices(years_arr, test_year, cache_dir=SPLIT_CACHE_DIR):
+def load_or_make_split_indices(years_arr, test_year, cal_years: int = 1, cache_dir=SPLIT_CACHE_DIR):
     """
     For test year Y:
-      train: years <= Y-2
-      cal:   years == Y-1
+      train: years <= Y - cal_years - 1
+      cal:   years in [Y-cal_years .. Y-1]
       test:  years == Y
     """
     ensure_dir(cache_dir)
-    fp = os.path.join(cache_dir, f"splits_Y{test_year}.npz")
+    fp = os.path.join(cache_dir, f"splits_Y{test_year}_cal{cal_years}.npz")
 
     if os.path.exists(fp):
         z = np.load(fp)
         return z["tr"], z["cal"], z["te"]
 
-    tr = np.flatnonzero(years_arr <= (test_year - 2))
-    cal = np.flatnonzero(years_arr == (test_year - 1))
+    tr = np.flatnonzero(years_arr <= (test_year - cal_years - 1))
+    cal = np.flatnonzero((years_arr >= (test_year - cal_years)) & (years_arr <= (test_year - 1)))
     te = np.flatnonzero(years_arr == test_year)
 
     np.savez_compressed(fp, tr=tr.astype(np.int32), cal=cal.astype(np.int32), te=te.astype(np.int32))
@@ -475,6 +475,24 @@ def parse_args():
         help="Print a progress heartbeat every N seconds (0 disables).",
     )
     p.add_argument(
+        "--cal-years",
+        type=int,
+        default=1,
+        help="Number of prior years used for calibration (default 1; try 3 for regime robustness).",
+    )
+    p.add_argument(
+        "--n-buckets",
+        type=int,
+        default=3,
+        help="Mondrian bucket count for conformal conditioning (default 3; try 5).",
+    )
+    p.add_argument(
+        "--sigma-proxy",
+        choices=["pred", "rv", "hybrid"],
+        default="pred",
+        help="Sigma for conformal normalization: pred=(q90-q10)/2, rv=EWMA realized vol, hybrid=max(pred,rv).",
+    )
+    p.add_argument(
         "--first-test-year",
         type=int,
         default=None,
@@ -513,6 +531,13 @@ def main():
     panel = panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     panel = panel.dropna(axis=1, how="all")
 
+    # Leak-free realized vol proxy (EWMA of squared daily return), shift(1) to avoid look-ahead.
+    if "ret_1" in panel.columns:
+        rv20 = (panel["ret_1"] ** 2).groupby(panel["Ticker"]).transform(lambda s: s.ewm(span=20, adjust=False).mean())
+        panel["sigma_rv20"] = np.sqrt(rv20).shift(1)
+    else:
+        panel["sigma_rv20"] = np.nan
+
     if args.min_panel_year is not None:
         min_y = int(args.min_panel_year)
         panel = panel.loc[panel["Date"].dt.year >= min_y].copy()
@@ -529,6 +554,7 @@ def main():
     years_arr = panel["Date"].dt.year.to_numpy(np.int16)
     dates_arr = panel["Date"].to_numpy()
     tickers_arr = panel["Ticker"].to_numpy()
+    sigma_rv_arr = panel["sigma_rv20"].to_numpy(dtype=np.float32, copy=False)
 
     # Feature matrix + target as float32 (faster + less RAM).
     X_all = panel[feat_cols].to_numpy(dtype=np.float32, copy=False)
@@ -552,6 +578,7 @@ def main():
         tickers_arr = tickers_arr[keep_mask]
         X_all = X_all[keep_mask]
         y_all = y_all[keep_mask]
+        sigma_rv_arr = sigma_rv_arr[keep_mask]
 
         print(f"Sampled {len(chosen)} tickers (seed={args.sample_seed}).")
 
@@ -568,7 +595,10 @@ def main():
     feat_sig = hashlib.sha1(("|".join(feat_cols)).encode("utf-8")).hexdigest()[:10]
     uniq_tickers = np.unique(tickers_arr)
     split_sig = hashlib.sha1(
-        ("|".join(uniq_tickers.tolist()) + f"|{years_arr.min()}|{years_arr.max()}|{len(years_arr)}").encode("utf-8")
+        (
+            "|".join(uniq_tickers.tolist())
+            + f"|{years_arr.min()}|{years_arr.max()}|{len(years_arr)}|cal{int(args.cal_years)}"
+        ).encode("utf-8")
     ).hexdigest()[:10]
 
     # Proxies for Mondrian bucketing (precompute once, if available).
@@ -608,9 +638,10 @@ def main():
     # Pre-filter to years that have enough rows for tr/cal/te. This avoids wasting
     # early years when sampling tickers with limited history.
     years_to_run = []
+    cal_years = int(args.cal_years)
     for Y in candidate_years:
-        tr_idx = np.flatnonzero(years_arr <= (Y - 2))
-        cal_idx = np.flatnonzero(years_arr == (Y - 1))
+        tr_idx = np.flatnonzero(years_arr <= (Y - cal_years - 1))
+        cal_idx = np.flatnonzero((years_arr >= (Y - cal_years)) & (years_arr <= (Y - 1)))
         te_idx = np.flatnonzero(years_arr == Y)
         if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
             years_to_run.append(Y)
@@ -631,17 +662,20 @@ def main():
             print("No valid walk-forward slices produced; check data coverage.", flush=True)
             return
         for i, Y in enumerate(years_to_run, start=1):
-            train_end = Y - 2
-            cal_year = Y - 1
+            train_end = Y - cal_years - 1
+            cal_year_start = Y - cal_years
+            cal_year_end = Y - 1
             test_year = Y
             progress.update(i=i, year=Y, phase="split")
 
             if args.cache_splits:
                 split_cache_dir = os.path.join(SPLIT_CACHE_DIR, split_sig)
-                tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y, cache_dir=split_cache_dir)
+                tr_idx, cal_idx, te_idx = load_or_make_split_indices(
+                    years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
+                )
             else:
                 tr_idx = np.flatnonzero(years_arr <= train_end)
-                cal_idx = np.flatnonzero(years_arr == cal_year)
+                cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
                 te_idx = np.flatnonzero(years_arr == test_year)
 
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
@@ -808,7 +842,21 @@ def main():
             # Heteroskedastic scale proxy (fallback to IQR, prefer regime proxy sigma).
             EPS = 1e-6
             cal_sigma_fallback = np.maximum(EPS, 0.5 * (cal_q[0.90] - cal_q[0.10]))
-            cal_sigma = sigma_from_proxy(cal_proxy, cal_sigma_fallback, eps=EPS)
+            cal_sigma_rv = sigma_rv_arr[cal_idx]
+
+            def pick_sigma(pred_sigma, rv_sigma, mode: str, eps: float = 1e-6):
+                pred_sigma = np.asarray(pred_sigma, dtype=np.float32)
+                rv_sigma = np.asarray(rv_sigma, dtype=np.float32)
+                if mode == "pred":
+                    s = pred_sigma
+                elif mode == "rv":
+                    s = rv_sigma
+                else:  # hybrid
+                    s = np.maximum(pred_sigma, rv_sigma)
+                s = np.where(np.isnan(s), pred_sigma, s)
+                return np.maximum(eps, s)
+
+            cal_sigma = pick_sigma(cal_sigma_fallback, cal_sigma_rv, mode=args.sigma_proxy, eps=EPS)
 
             # Two-sided CQR normalized nonconformity score (single score).
             # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
@@ -826,7 +874,7 @@ def main():
                     return None
                 return edges
 
-            edges = make_edges(cal_proxy, n_bins=args.regime_bins)
+            edges = make_edges(cal_proxy, n_bins=args.n_buckets)
 
             def bucketize(arr, edges_in, n):
                 if arr is None or edges_in is None:
@@ -904,7 +952,8 @@ def main():
             )
 
             te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
-            te_sigma = sigma_from_proxy(te_proxy, te_sigma_fallback, eps=EPS)
+            te_sigma_rv = sigma_rv_arr[te_idx]
+            te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=args.sigma_proxy, eps=EPS)
             te_bucket = bucketize(te_proxy, edges, len(yte))
 
             conf_bands = {}
