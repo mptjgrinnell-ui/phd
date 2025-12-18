@@ -200,7 +200,8 @@ def main():
                 return np.zeros(n, dtype=int)
             breaks = edges_in[1:-1]
             b = np.digitize(arr, breaks, right=True)
-            return np.where(np.isnan(arr), 0, b)
+            b = np.where(np.isnan(arr), 0, b)
+            return np.clip(b, 0, len(breaks)).astype(int)
 
         cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
 
