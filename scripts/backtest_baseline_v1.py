@@ -537,12 +537,18 @@ def main():
 
     # Proxies for Mondrian bucketing (precompute once, if available).
     proxy_vix_absret1 = None
+    proxy_vix_level = None
     proxy_spy_range_std21 = None
+    proxy_spy_rvol21 = None
     proxy_own_range_std21 = None
     if "CTX_^VIX_ret_1" in panel.columns:
         proxy_vix_absret1 = np.abs(panel["CTX_^VIX_ret_1"].to_numpy(dtype=np.float32, copy=False))
+    if "CTX_^VIX_close" in panel.columns:
+        proxy_vix_level = panel["CTX_^VIX_close"].to_numpy(dtype=np.float32, copy=False)
     if "CTX_SPY_range_std_21" in panel.columns:
         proxy_spy_range_std21 = panel["CTX_SPY_range_std_21"].to_numpy(dtype=np.float32, copy=False)
+    if "CTX_SPY_rvol_21" in panel.columns:
+        proxy_spy_rvol21 = panel["CTX_SPY_rvol_21"].to_numpy(dtype=np.float32, copy=False)
     if "range_std_21" in panel.columns:
         proxy_own_range_std21 = panel["range_std_21"].to_numpy(dtype=np.float32, copy=False)
 
@@ -674,18 +680,32 @@ def main():
             progress.update(phase="calibrate_conformal")
             # Predict on calibration for normalized conformal
             cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
+
+            # Heteroskedastic scale proxy (same idea as before).
             cal_sigma = np.maximum(1e-6, 0.5 * (cal_q[0.90] - cal_q[0.10]))
-            cal_s = np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma
+
+            # Two-sided (asymmetric) normalized nonconformity scores.
+            cal_s_lo = (cal_q[0.05] - ycal) / cal_sigma  # lower tail shortfall
+            cal_s_hi = (ycal - cal_q[0.95]) / cal_sigma  # upper tail shortfall
+            cal_s_lo = np.maximum(0.0, cal_s_lo)
+            cal_s_hi = np.maximum(0.0, cal_s_hi)
 
             # Mondrian buckets via volatility proxy (precomputed once, then indexed).
+            # Prefer a regime proxy that represents "state" (level/realized vol), not just a noisy 1-day move.
             cal_proxy = None
             te_proxy = None
-            if proxy_vix_absret1 is not None:
-                cal_proxy = proxy_vix_absret1[cal_idx]
-                te_proxy = proxy_vix_absret1[te_idx]
+            if proxy_vix_level is not None:
+                cal_proxy = proxy_vix_level[cal_idx]
+                te_proxy = proxy_vix_level[te_idx]
+            elif proxy_spy_rvol21 is not None:
+                cal_proxy = proxy_spy_rvol21[cal_idx]
+                te_proxy = proxy_spy_rvol21[te_idx]
             elif proxy_spy_range_std21 is not None:
                 cal_proxy = proxy_spy_range_std21[cal_idx]
                 te_proxy = proxy_spy_range_std21[te_idx]
+            elif proxy_vix_absret1 is not None:
+                cal_proxy = proxy_vix_absret1[cal_idx]
+                te_proxy = proxy_vix_absret1[te_idx]
             elif proxy_own_range_std21 is not None:
                 cal_proxy = proxy_own_range_std21[cal_idx]
                 te_proxy = proxy_own_range_std21[te_idx]
@@ -712,24 +732,50 @@ def main():
                 b = np.where(np.isnan(arr), 0, b)
                 return np.clip(b, 0, len(breaks)).astype(int)
 
-            cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
+            cal_bucket = bucketize(cal_proxy, edges, len(cal_s_lo))
 
-            # Compute qhat per bucket with fallback to global
-            qhat_global = {alpha: float(np.quantile(cal_s[~np.isnan(cal_s)], 1 - alpha)) for alpha in ALPHAS}
-            qhat_bucket = {}
+            def _qhat(arr, alpha, default=0.0):
+                v = arr[~np.isnan(arr)]
+                if v.size == 0:
+                    return float(default)
+                return float(np.quantile(v, 1 - alpha))
+
+            # Global fallback quantiles (two-sided).
+            qhat_global_lo = {alpha: _qhat(cal_s_lo, alpha) for alpha in ALPHAS}
+            qhat_global_hi = {alpha: _qhat(cal_s_hi, alpha) for alpha in ALPHAS}
+
+            # Bucketed quantiles (two-sided).
+            qhat_bucket_lo = {}
+            qhat_bucket_hi = {}
+
             for b in np.unique(cal_bucket):
                 mask = cal_bucket == b
-                scores_b = cal_s[mask]
-                if scores_b.size == 0 or np.all(np.isnan(scores_b)):
-                    continue
-                for alpha in ALPHAS:
-                    qhat_bucket.setdefault(alpha, {})
-                    qhat_bucket[alpha][b] = float(np.quantile(scores_b[~np.isnan(scores_b)], 1 - alpha))
 
-            def get_qhat(alpha, b):
-                if alpha in qhat_bucket and b in qhat_bucket[alpha]:
-                    return qhat_bucket[alpha][b]
-                return qhat_global[alpha]
+                s_lo_b = cal_s_lo[mask]
+                s_hi_b = cal_s_hi[mask]
+
+                if s_lo_b.size == 0 or np.all(np.isnan(s_lo_b)):
+                    s_lo_b = None
+                if s_hi_b.size == 0 or np.all(np.isnan(s_hi_b)):
+                    s_hi_b = None
+
+                for alpha in ALPHAS:
+                    if s_lo_b is not None:
+                        qhat_bucket_lo.setdefault(alpha, {})
+                        qhat_bucket_lo[alpha][b] = _qhat(s_lo_b, alpha, default=qhat_global_lo[alpha])
+                    if s_hi_b is not None:
+                        qhat_bucket_hi.setdefault(alpha, {})
+                        qhat_bucket_hi[alpha][b] = _qhat(s_hi_b, alpha, default=qhat_global_hi[alpha])
+
+            def get_qhat_lo(alpha, b):
+                if alpha in qhat_bucket_lo and b in qhat_bucket_lo[alpha]:
+                    return qhat_bucket_lo[alpha][b]
+                return qhat_global_lo[alpha]
+
+            def get_qhat_hi(alpha, b):
+                if alpha in qhat_bucket_hi and b in qhat_bucket_hi[alpha]:
+                    return qhat_bucket_hi[alpha][b]
+                return qhat_global_hi[alpha]
 
             progress.update(phase="predict")
             progress.update(sub_done=0, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
@@ -764,9 +810,11 @@ def main():
             conf_bands = {}
             for alpha in ALPHAS:
                 pct = int((1 - alpha) * 100)
-                adj = np.array([get_qhat(alpha, b) for b in te_bucket]) * te_sigma
-                conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj
-                conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj
+                adj_lo = np.array([get_qhat_lo(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
+                adj_hi = np.array([get_qhat_hi(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
+
+                conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj_lo
+                conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj_hi
             progress.update(sub_done=len(Q_LIST) + 2, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
 
             out = pd.DataFrame({"Date": dates_arr[te_idx], "Ticker": tickers_arr[te_idx]})
