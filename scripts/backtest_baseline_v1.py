@@ -1,9 +1,12 @@
 import os
+import sys
 import argparse
+import atexit
 import time
 import hashlib
 import threading
 import concurrent.futures
+import re
 import numpy as np
 import pandas as pd
 import yaml
@@ -26,6 +29,60 @@ MIN_CAL_ROWS = 1000
 MIN_TEST_ROWS = 1000
 
 
+def _setup_run_logging(log_dir="log", base_name="log"):
+    os.makedirs(log_dir, exist_ok=True)
+
+    existing = []
+    pat = re.compile(rf"^{re.escape(base_name)}(\d+)\.txt$")
+    for name in os.listdir(log_dir):
+        m = pat.match(name)
+        if m:
+            existing.append(int(m.group(1)))
+    n = (max(existing) + 1) if existing else 1
+
+    run_path = os.path.join(log_dir, f"{base_name}{n}.txt")
+    latest_path = os.path.join(log_dir, "latest.txt")
+
+    run_f = open(run_path, "w", encoding="utf-8", buffering=1)
+    latest_f = open(latest_path, "w", encoding="utf-8", buffering=1)
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+
+        def write(self, s):
+            for st in self._streams:
+                st.write(s)
+            return len(s)
+
+        def flush(self):
+            for st in self._streams:
+                st.flush()
+
+        def isatty(self):
+            return False
+
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(orig_out, run_f, latest_f)
+    sys.stderr = _Tee(orig_err, run_f, latest_f)
+
+    def _cleanup():
+        try:
+            sys.stdout = orig_out
+            sys.stderr = orig_err
+        finally:
+            try:
+                run_f.close()
+            finally:
+                latest_f.close()
+
+    atexit.register(_cleanup)
+
+    print(f"[log] writing console output to {run_path} (also {latest_path})", flush=True)
+    print(f"[log] cmd: {' '.join(sys.argv)}", flush=True)
+    return run_path
+
+
 class ProgressReporter:
     PHASE_STEPS = 6
     PHASE_TO_STEP = {
@@ -42,6 +99,9 @@ class ProgressReporter:
         "no_valid_years": 0,
     }
     _SPIN = "|/-\\"
+    FITQ_UNITS = len(Q_LIST)
+    PRED_UNITS = len(Q_LIST) + 2  # 5 quantiles + p_up + bands
+    UNITS_PER_YEAR = 1 + 1 + FITQ_UNITS + 1 + 1 + PRED_UNITS  # split + prep + fitq + dir + calib + pred
 
     def __init__(self, total, every_sec: float = 5.0):
         self.total = int(total)
@@ -66,6 +126,9 @@ class ProgressReporter:
             "start_ts": time.time(),
             "year_start_ts": time.time(),
             "last_event_ts": time.time(),
+            "unit_timer_ts": time.time(),
+            "ema_sec_per_unit": None,
+            "ema_n": 0,
             "spin_i": 0,
         }
 
@@ -83,6 +146,7 @@ class ProgressReporter:
         event = bool(kwargs.pop("event", False))
 
         with self._lock:
+            prev = dict(self._state)
             if "phase" in kwargs and "phase_step" not in kwargs:
                 phase = kwargs["phase"]
                 kwargs["phase_step"] = self.PHASE_TO_STEP.get(phase, 0)
@@ -101,10 +165,29 @@ class ProgressReporter:
                     kwargs.setdefault("sub_done", 0)
                     kwargs.setdefault("sub_name", "")
 
+            now = time.time()
             if force_print or event:
                 kwargs["last_event_ts"] = time.time()
 
             self._state.update(kwargs)
+
+            # Update unit-timing EMA when progress advances (phase/subprogress).
+            prev_units = self._units_done_total(prev)
+            curr_units = self._units_done_total(self._state)
+            delta_units = curr_units - prev_units
+            if delta_units > 0:
+                dt = max(1e-6, now - float(prev.get("unit_timer_ts", prev.get("start_ts", now))))
+                per_unit = dt / delta_units
+                ema = self._state.get("ema_sec_per_unit")
+                if ema is None:
+                    ema = per_unit
+                else:
+                    # Exponential moving average for stability.
+                    alpha = 0.2
+                    ema = (1 - alpha) * float(ema) + alpha * per_unit
+                self._state["ema_sec_per_unit"] = float(ema)
+                self._state["ema_n"] = int(self._state.get("ema_n", 0)) + 1
+                self._state["unit_timer_ts"] = now
 
         if force_print:
             self.print_now()
@@ -117,6 +200,47 @@ class ProgressReporter:
         with self._lock:
             self._state["spin_i"] = int(self._state.get("spin_i", 0)) + 1
             return self._SPIN[self._state["spin_i"] % len(self._SPIN)]
+
+    def _format_secs(self, sec: float):
+        sec = max(0.0, float(sec))
+        if sec < 90:
+            return f"{sec:,.0f}s"
+        m, s = divmod(int(sec + 0.5), 60)
+        if m < 90:
+            return f"{m}m{s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
+
+    def _units_done_total(self, s: dict):
+        total_years = max(self.total, 1)
+        year_i = int(s.get("i", 0))
+        years_done = min(max(year_i - 1, 0), total_years)
+
+        phase = str(s.get("phase", "init"))
+        sub_done = int(s.get("sub_done", 0))
+        sub_total = int(s.get("sub_total", 0))
+        if sub_total > 0:
+            sub_frac = min(max(sub_done / max(sub_total, 1), 0.0), 1.0)
+        else:
+            sub_frac = 0.0
+
+        # Units within the current year.
+        if phase in ("init", "split", "no_valid_years"):
+            yr_units = 0.0
+        elif phase == "prep":
+            yr_units = 1.0  # split
+        elif phase == "fit_quantiles":
+            yr_units = 2.0 + self.FITQ_UNITS * sub_frac  # split+prep + quantiles
+        elif phase == "fit_direction":
+            yr_units = 2.0 + self.FITQ_UNITS
+        elif phase == "calibrate_conformal":
+            yr_units = 3.0 + self.FITQ_UNITS
+        elif phase == "predict":
+            yr_units = 4.0 + self.FITQ_UNITS + self.PRED_UNITS * sub_frac
+        else:
+            yr_units = float(self.UNITS_PER_YEAR)
+
+        return years_done * float(self.UNITS_PER_YEAR) + min(max(yr_units, 0.0), float(self.UNITS_PER_YEAR))
 
     def _format_line(self, s: dict, spin: str):
         total_years = max(self.total, 1)
@@ -142,11 +266,21 @@ class ProgressReporter:
         since_evt = max(0.0, now - float(s.get("last_event_ts", s["start_ts"])))
 
         # "cum_test_rows" reflects completed years only. Provide an estimate as the
-        # year advances based on phase/subprogress (not time).
+        # year advances based on phase/subprogress.
         year_te_rows = int(s.get("rows_te", 0))
         year_te_done_est = int(round(year_te_rows * year_frac))
         cum_done = int(s.get("cum_test_rows", 0))
         cum_te_est = cum_done + year_te_done_est
+
+        # ETA based on unit timings (EMA seconds per unit).
+        units_done = self._units_done_total(s)
+        total_units = float(total_years) * float(self.UNITS_PER_YEAR)
+        remaining_units = max(0.0, total_units - units_done)
+        ema = s.get("ema_sec_per_unit")
+        eta_txt = "eta=?"
+        if ema is not None and int(s.get("ema_n", 0)) >= 2:
+            eta_txt = f"eta={self._format_secs(remaining_units * float(ema))}"
+
         y = s["year"]
         ytxt = "?" if y is None else str(y)
         subtxt = ""
@@ -157,7 +291,7 @@ class ProgressReporter:
             f"Y={ytxt}  phase={s['phase']}{subtxt}  "
             f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
             f"cum_te_est={cum_te_est} (done={cum_done})  yr_te_est={year_te_done_est}/{year_te_rows}  "
-            f"t={elapsed:,.0f}s  idle={since_evt:,.0f}s"
+            f"{eta_txt}  t={self._format_secs(elapsed)}  idle={self._format_secs(since_evt)}"
         )
 
     def print_now(self):
@@ -332,6 +466,7 @@ def parse_args():
 
 
 def main():
+    _setup_run_logging()
     args = parse_args()
     backtest_cfg = args.backtest_cfg
     features_cfg = args.features_cfg

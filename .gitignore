@@ -12,3 +12,7 @@ Thumbs.db
 # Generated caches
 data/meta/split_cache_v*/
 data/meta/prep_cache_v*/
+
+# Run logs
+log/*.txt
+log/.ipynb_checkpoints/
