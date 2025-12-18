@@ -141,11 +141,12 @@ class ProgressReporter:
         elapsed = max(1e-6, now - s["start_ts"])
         since_evt = max(0.0, now - float(s.get("last_event_ts", s["start_ts"])))
 
-        # "cum_test_rows" reflects completed years only; during a year it's still 0.
-        # Show an honest per-year rate using the known test-set size for the year.
-        year_elapsed = max(1e-6, now - float(s.get("year_start_ts", s["start_ts"])))
+        # "cum_test_rows" reflects completed years only. Provide an estimate as the
+        # year advances based on phase/subprogress (not time).
         year_te_rows = int(s.get("rows_te", 0))
-        year_rows_rate = year_te_rows / year_elapsed
+        year_te_done_est = int(round(year_te_rows * year_frac))
+        cum_done = int(s.get("cum_test_rows", 0))
+        cum_te_est = cum_done + year_te_done_est
         y = s["year"]
         ytxt = "?" if y is None else str(y)
         subtxt = ""
@@ -155,7 +156,7 @@ class ProgressReporter:
             f"{spin} [progress] {pct:5.1f}% (year {min(max(year_i, 0), total_years)}/{total_years})  "
             f"Y={ytxt}  phase={s['phase']}{subtxt}  "
             f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
-            f"cum_te_done={s['cum_test_rows']}  yr_te_rows/s={year_rows_rate:,.1f}  "
+            f"cum_te_est={cum_te_est} (done={cum_done})  yr_te_est={year_te_done_est}/{year_te_rows}  "
             f"t={elapsed:,.0f}s  idle={since_evt:,.0f}s"
         )
 
