@@ -10,6 +10,7 @@ import yaml
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
@@ -425,19 +426,30 @@ def main():
             q_models = dict(q_pairs)
 
             progress.update(phase="fit_direction")
-            # Direction model (up/down) + calibration on the calibration year
+            # ---------------------------
+            # Direction model (up/down) + calibration on calibration year
+            # Fixes:
+            #  - ConvergenceWarning: raise max_iter + stronger regularization
+            #  - prefit deprecation: use FrozenEstimator with CalibratedClassifierCV
+            # ---------------------------
+
             ytr_up = (ytr > 0).astype(int)
             ycal_up = (ycal > 0).astype(int)
+
+            USE_CLASS_BALANCE = True
 
             clf = LogisticRegression(
                 solver="saga",
                 penalty="l2",
-                C=1.0,
-                max_iter=2000,
+                C=0.2,
+                max_iter=5000,
                 tol=1e-4,
                 n_jobs=-1,
                 random_state=42,
+                class_weight=("balanced" if USE_CLASS_BALANCE else None),
             )
+
+            # Fit LR on TRAIN only (Xtr is already imputed+scaled).
             clf.fit(Xtr, ytr_up)
 
             progress.update(phase="calibrate_conformal")
@@ -506,9 +518,19 @@ def main():
             # Calibrate probabilities using the calibration year (Platt/sigmoid).
             # Guard against tiny samples where calibration labels collapse to 1 class.
             if np.unique(ycal_up).size >= 2:
-                cal_clf = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
-                cal_clf.fit(Xcal, ycal_up)
-                pup = cal_clf.predict_proba(Xte)[:, 1]
+                min_class = int(np.min(np.bincount(ycal_up)))
+                cv_splits = min(5, min_class)
+                if cv_splits >= 2:
+                    frozen = FrozenEstimator(clf)
+                    cal_clf = CalibratedClassifierCV(
+                        estimator=frozen,
+                        method="sigmoid",
+                        cv=cv_splits,
+                    )
+                    cal_clf.fit(Xcal, ycal_up)
+                    pup = cal_clf.predict_proba(Xte)[:, 1]
+                else:
+                    pup = clf.predict_proba(Xte)[:, 1]
             else:
                 pup = clf.predict_proba(Xte)[:, 1]
 
