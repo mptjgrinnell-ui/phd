@@ -627,6 +627,17 @@ def main():
             X_all = X_all[:, keep_mask]
             print(f"Dropped {dropped} constant cols; remaining={len(feat_cols)}")
 
+    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
+    n_buckets = (
+        int(args.regime_buckets)
+        if args.regime_buckets is not None
+        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
+    )
+    if cal_years < 1:
+        raise ValueError("--cal-years must be >= 1")
+    if n_buckets < 2:
+        raise ValueError("--regime-buckets must be >= 2")
+
     feat_sig = hashlib.sha1(("|".join(feat_cols)).encode("utf-8")).hexdigest()[:10]
     uniq_tickers = np.unique(tickers_arr)
     split_sig = hashlib.sha1(
@@ -663,30 +674,8 @@ def main():
         if args.last_test_year is not None
         else int(bcfg["walk_forward"]["last_test_year"])
     )
-    default_cal_years = int(bcfg["walk_forward"].get("cal_years", 1))
-    cal_years = int(args.cal_years) if args.cal_years is not None else default_cal_years
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
-    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
-    n_buckets = (
-        int(args.regime_buckets)
-        if args.regime_buckets is not None
-        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
-    )
-    if cal_years < 1:
-        raise ValueError("--cal-years must be >= 1")
-    if n_buckets < 2:
-        raise ValueError("--regime-buckets must be >= 2")
-    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
-    n_buckets = (
-        int(args.regime_buckets)
-        if args.regime_buckets is not None
-        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
-    )
-    if cal_years < 1:
-        raise ValueError("--cal-years must be >= 1")
-    if n_buckets < 2:
-        raise ValueError("--regime-buckets must be >= 2")
 
     tape_rows = []
 
@@ -1017,7 +1006,7 @@ def main():
             te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
             te_sigma_rv = sigma_rv_arr[te_idx]
             te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=args.sigma_proxy, eps=EPS)
-            te_bucket = bucketize(te_proxy, breaks, len(yte))
+            te_bucket = bucketize(te_proxy, edges, len(yte))
 
             conf_bands = {}
             eta.start()
