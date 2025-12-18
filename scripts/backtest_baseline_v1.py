@@ -785,15 +785,6 @@ def main():
             eta.start()
             cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
 
-            # Heteroskedastic scale proxy (fallback to IQR, prefer regime proxy sigma).
-            EPS = 1e-6
-            cal_sigma_fallback = np.maximum(EPS, 0.5 * (cal_q[0.90] - cal_q[0.10]))
-            cal_sigma = sigma_from_proxy(cal_proxy, cal_sigma_fallback, eps=EPS)
-
-            # Two-sided CQR normalized nonconformity score (single score).
-            # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
-            cal_s = np.maximum(0.0, np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma)
-
             # Mondrian buckets via volatility proxy (precomputed once, then indexed).
             # Prefer a regime proxy that represents "state" (level/realized vol), not just a noisy 1-day move.
             cal_proxy = None
@@ -813,6 +804,15 @@ def main():
             elif proxy_own_range_std21 is not None:
                 cal_proxy = proxy_own_range_std21[cal_idx]
                 te_proxy = proxy_own_range_std21[te_idx]
+
+            # Heteroskedastic scale proxy (fallback to IQR, prefer regime proxy sigma).
+            EPS = 1e-6
+            cal_sigma_fallback = np.maximum(EPS, 0.5 * (cal_q[0.90] - cal_q[0.10]))
+            cal_sigma = sigma_from_proxy(cal_proxy, cal_sigma_fallback, eps=EPS)
+
+            # Two-sided CQR normalized nonconformity score (single score).
+            # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
+            cal_s = np.maximum(0.0, np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma)
 
             def make_edges(proxy_arr, n_bins=4):
                 if proxy_arr is None:
