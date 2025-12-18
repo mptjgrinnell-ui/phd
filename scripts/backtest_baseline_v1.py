@@ -19,6 +19,9 @@ Q_LIST = [0.05, 0.10, 0.50, 0.90, 0.95]
 ALPHAS = [0.10, 0.05]  # 90%, 95%
 SPLIT_CACHE_DIR = "data/meta/split_cache_v1"
 PREP_CACHE_DIR = "data/meta/prep_cache_v1"
+MIN_TRAIN_ROWS = 10000
+MIN_CAL_ROWS = 1000
+MIN_TEST_ROWS = 1000
 
 
 class ProgressReporter:
@@ -251,7 +254,21 @@ def main():
 
     tape_rows = []
 
-    years_to_run = list(make_year_slices(panel, first_test_year, last_test_year))
+    candidate_years = list(make_year_slices(panel, first_test_year, last_test_year))
+
+    # Pre-filter to years that have enough rows for tr/cal/te. This avoids wasting
+    # early years when sampling tickers with limited history.
+    years_to_run = []
+    for Y in candidate_years:
+        if args.cache_splits:
+            tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y)
+        else:
+            tr_idx = np.flatnonzero(years_arr <= (Y - 2))
+            cal_idx = np.flatnonzero(years_arr == (Y - 1))
+            te_idx = np.flatnonzero(years_arr == Y)
+        if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
+            years_to_run.append(Y)
+
     if max_years is not None:
         years_to_run = years_to_run[: int(max_years)]
 
@@ -261,6 +278,10 @@ def main():
     processed = 0
     cum_test_rows = 0
     try:
+        if not years_to_run:
+            progress.update(phase="no_valid_years")
+            print("No valid walk-forward slices produced; check data coverage.")
+            return
         for i, Y in enumerate(years_to_run, start=1):
             train_end = Y - 2
             cal_year = Y - 1
