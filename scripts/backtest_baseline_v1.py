@@ -395,14 +395,18 @@ def load_or_make_split_indices(years_arr, test_year, cal_years: int = 1, cache_d
       test:  years == Y
     """
     ensure_dir(cache_dir)
-    fp = os.path.join(cache_dir, f"splits_Y{test_year}_cal{cal_years}.npz")
+    fp = os.path.join(cache_dir, f"splits_Y{test_year}_K{int(cal_years)}.npz")
 
     if os.path.exists(fp):
         z = np.load(fp)
         return z["tr"], z["cal"], z["te"]
 
-    tr = np.flatnonzero(years_arr <= (test_year - cal_years - 1))
-    cal = np.flatnonzero((years_arr >= (test_year - cal_years)) & (years_arr <= (test_year - 1)))
+    Y = int(test_year)
+    K = int(cal_years)
+    cal_start = Y - K
+
+    tr = np.flatnonzero(years_arr < cal_start)
+    cal = np.flatnonzero((years_arr >= cal_start) & (years_arr <= (Y - 1)))
     te = np.flatnonzero(years_arr == test_year)
 
     np.savez_compressed(fp, tr=tr.astype(np.int32), cal=cal.astype(np.int32), te=te.astype(np.int32))
@@ -680,9 +684,9 @@ def main():
                     years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
                 )
             else:
-                tr_idx = np.flatnonzero(years_arr < cal_year_start)
-                cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
-                te_idx = np.flatnonzero(years_arr == test_year)
+            tr_idx = np.flatnonzero(years_arr < cal_year_start)
+            cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
+            te_idx = np.flatnonzero(years_arr == test_year)
 
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
             if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
@@ -704,6 +708,11 @@ def main():
             Xtr, ytr = X_all[tr_idx], y_all[tr_idx]
             Xcal, ycal = X_all[cal_idx], y_all[cal_idx]
             Xte, yte = X_all[te_idx], y_all[te_idx]
+            Xtr = np.ascontiguousarray(Xtr, dtype=np.float32)
+            Xcal = np.ascontiguousarray(Xcal, dtype=np.float32)
+            Xte = np.ascontiguousarray(Xte, dtype=np.float32)
+            dates_te = dates_arr[te_idx]
+            tickers_te = tickers_arr[te_idx]
 
             total_years = len(years_to_run)
             remaining_years_after = max(0, total_years - i)
