@@ -92,6 +92,15 @@ def conformal_qhat(scores: np.ndarray, alpha: float, default: float = 0.0) -> fl
     return float(np.partition(v, k - 1)[k - 1])
 
 
+def sigma_from_proxy(proxy_arr, fallback_sigma, eps=1e-6):
+    if proxy_arr is None:
+        return fallback_sigma
+    s = np.asarray(proxy_arr, dtype=float)
+    s = np.where(np.isnan(s), np.nan, s)
+    s = np.maximum(eps, s)
+    return np.where(np.isnan(s), fallback_sigma, s)
+
+
 def _setup_run_logging(log_dir="log", base_name="log"):
     os.makedirs(log_dir, exist_ok=True)
 
@@ -483,6 +492,7 @@ def parse_args():
         default=None,
         help="If set, drop panel rows with Date.year < this to reduce IO/RAM (debug speedup).",
     )
+    p.add_argument("--regime-bins", type=int, default=4, help="Bins for regime/Mondrian proxy (default 4).")
     return p.parse_args()
 
 
@@ -775,8 +785,10 @@ def main():
             eta.start()
             cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
 
-            # Heteroskedastic scale proxy (same idea as before).
-            cal_sigma = np.maximum(1e-6, 0.5 * (cal_q[0.90] - cal_q[0.10]))
+            # Heteroskedastic scale proxy (fallback to IQR, prefer regime proxy sigma).
+            EPS = 1e-6
+            cal_sigma_fallback = np.maximum(EPS, 0.5 * (cal_q[0.90] - cal_q[0.10]))
+            cal_sigma = sigma_from_proxy(cal_proxy, cal_sigma_fallback, eps=EPS)
 
             # Two-sided CQR normalized nonconformity score (single score).
             # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
@@ -808,13 +820,13 @@ def main():
                 vals = proxy_arr[~np.isnan(proxy_arr)]
                 if len(vals) < 100:
                     return None
-                qs = np.quantile(vals, [0, 0.25, 0.5, 0.75, 1.0])
+                qs = np.quantile(vals, np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1))
                 edges = np.unique(qs)
                 if len(edges) < 3:
                     return None
                 return edges
 
-            edges = make_edges(cal_proxy)
+            edges = make_edges(cal_proxy, n_bins=args.regime_bins)
 
             def bucketize(arr, edges_in, n):
                 if arr is None or edges_in is None:
@@ -891,7 +903,8 @@ def main():
                 force_print=True,
             )
 
-            te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
+            te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
+            te_sigma = sigma_from_proxy(te_proxy, te_sigma_fallback, eps=EPS)
             te_bucket = bucketize(te_proxy, edges, len(yte))
 
             conf_bands = {}
