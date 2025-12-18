@@ -684,9 +684,9 @@ def main():
                     years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
                 )
             else:
-            tr_idx = np.flatnonzero(years_arr < cal_year_start)
-            cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
-            te_idx = np.flatnonzero(years_arr == test_year)
+                tr_idx = np.flatnonzero(years_arr < cal_year_start)
+                cal_idx = np.flatnonzero((years_arr >= cal_year_start) & (years_arr <= cal_year_end))
+                te_idx = np.flatnonzero(years_arr == test_year)
 
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
             if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
