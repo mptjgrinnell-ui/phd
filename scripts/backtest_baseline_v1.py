@@ -29,6 +29,51 @@ MIN_CAL_ROWS = 1000
 MIN_TEST_ROWS = 1000
 
 
+class ETATracker:
+    """
+    ETA based on completed stage-units, with exponential moving average (EMA)
+    of seconds per unit per stage.
+    """
+
+    def __init__(self, alpha=0.25, defaults=None):
+        self.alpha = float(alpha)
+        self.ema = {}  # stage -> seconds per unit
+        self._t0 = None
+        self._units = 1
+        self.defaults = dict(
+            {
+                "fit_quantiles": 120.0,  # per quantile model until learned
+                "fit_direction": 10.0,
+                "calibrate_conformal": 10.0,
+                "predict": 0.5,  # per predict substep
+            },
+            **(defaults or {}),
+        )
+
+    def start(self, units: int = 1):
+        self._t0 = time.time()
+        self._units = max(1, int(units))
+
+    def end(self, stage: str):
+        if self._t0 is None:
+            return
+        dt = max(1e-9, time.time() - self._t0)
+        per_unit = dt / max(1, int(self._units))
+        if stage not in self.ema:
+            self.ema[stage] = per_unit
+        else:
+            self.ema[stage] = (1 - self.alpha) * float(self.ema[stage]) + self.alpha * per_unit
+        self._t0 = None
+        self._units = 1
+
+    def eta_seconds(self, remaining_units_by_stage: dict) -> float:
+        eta = 0.0
+        for stage, rem_units in remaining_units_by_stage.items():
+            per = self.ema.get(stage, self.defaults.get(stage, 1.0))
+            eta += float(per) * float(rem_units)
+        return float(max(0.0, eta))
+
+
 def _setup_run_logging(log_dir="log", base_name="log"):
     os.makedirs(log_dir, exist_ok=True)
 
@@ -99,9 +144,6 @@ class ProgressReporter:
         "no_valid_years": 0,
     }
     _SPIN = "|/-\\"
-    FITQ_UNITS = len(Q_LIST)
-    PRED_UNITS = len(Q_LIST) + 2  # 5 quantiles + p_up + bands
-    UNITS_PER_YEAR = 1 + 1 + FITQ_UNITS + 1 + 1 + PRED_UNITS  # split + prep + fitq + dir + calib + pred
 
     def __init__(self, total, every_sec: float = 5.0):
         self.total = int(total)
@@ -126,9 +168,7 @@ class ProgressReporter:
             "start_ts": time.time(),
             "year_start_ts": time.time(),
             "last_event_ts": time.time(),
-            "unit_timer_ts": time.time(),
-            "ema_sec_per_unit": None,
-            "ema_n": 0,
+            "eta_sec": None,
             "spin_i": 0,
         }
 
@@ -146,7 +186,6 @@ class ProgressReporter:
         event = bool(kwargs.pop("event", False))
 
         with self._lock:
-            prev = dict(self._state)
             if "phase" in kwargs and "phase_step" not in kwargs:
                 phase = kwargs["phase"]
                 kwargs["phase_step"] = self.PHASE_TO_STEP.get(phase, 0)
@@ -165,29 +204,10 @@ class ProgressReporter:
                     kwargs.setdefault("sub_done", 0)
                     kwargs.setdefault("sub_name", "")
 
-            now = time.time()
             if force_print or event:
                 kwargs["last_event_ts"] = time.time()
 
             self._state.update(kwargs)
-
-            # Update unit-timing EMA when progress advances (phase/subprogress).
-            prev_units = self._units_done_total(prev)
-            curr_units = self._units_done_total(self._state)
-            delta_units = curr_units - prev_units
-            if delta_units > 0:
-                dt = max(1e-6, now - float(prev.get("unit_timer_ts", prev.get("start_ts", now))))
-                per_unit = dt / delta_units
-                ema = self._state.get("ema_sec_per_unit")
-                if ema is None:
-                    ema = per_unit
-                else:
-                    # Exponential moving average for stability.
-                    alpha = 0.2
-                    ema = (1 - alpha) * float(ema) + alpha * per_unit
-                self._state["ema_sec_per_unit"] = float(ema)
-                self._state["ema_n"] = int(self._state.get("ema_n", 0)) + 1
-                self._state["unit_timer_ts"] = now
 
         if force_print:
             self.print_now()
@@ -210,37 +230,6 @@ class ProgressReporter:
             return f"{m}m{s:02d}s"
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
-
-    def _units_done_total(self, s: dict):
-        total_years = max(self.total, 1)
-        year_i = int(s.get("i", 0))
-        years_done = min(max(year_i - 1, 0), total_years)
-
-        phase = str(s.get("phase", "init"))
-        sub_done = int(s.get("sub_done", 0))
-        sub_total = int(s.get("sub_total", 0))
-        if sub_total > 0:
-            sub_frac = min(max(sub_done / max(sub_total, 1), 0.0), 1.0)
-        else:
-            sub_frac = 0.0
-
-        # Units within the current year.
-        if phase in ("init", "split", "no_valid_years"):
-            yr_units = 0.0
-        elif phase == "prep":
-            yr_units = 1.0  # split
-        elif phase == "fit_quantiles":
-            yr_units = 2.0 + self.FITQ_UNITS * sub_frac  # split+prep + quantiles
-        elif phase == "fit_direction":
-            yr_units = 2.0 + self.FITQ_UNITS
-        elif phase == "calibrate_conformal":
-            yr_units = 3.0 + self.FITQ_UNITS
-        elif phase == "predict":
-            yr_units = 4.0 + self.FITQ_UNITS + self.PRED_UNITS * sub_frac
-        else:
-            yr_units = float(self.UNITS_PER_YEAR)
-
-        return years_done * float(self.UNITS_PER_YEAR) + min(max(yr_units, 0.0), float(self.UNITS_PER_YEAR))
 
     def _format_line(self, s: dict, spin: str):
         total_years = max(self.total, 1)
@@ -272,14 +261,10 @@ class ProgressReporter:
         cum_done = int(s.get("cum_test_rows", 0))
         cum_te_est = cum_done + year_te_done_est
 
-        # ETA based on unit timings (EMA seconds per unit).
-        units_done = self._units_done_total(s)
-        total_units = float(total_years) * float(self.UNITS_PER_YEAR)
-        remaining_units = max(0.0, total_units - units_done)
-        ema = s.get("ema_sec_per_unit")
+        eta_sec = s.get("eta_sec")
         eta_txt = "eta=?"
-        if ema is not None and int(s.get("ema_n", 0)) >= 2:
-            eta_txt = f"eta={self._format_secs(remaining_units * float(ema))}"
+        if eta_sec is not None:
+            eta_txt = f"eta={self._format_secs(float(eta_sec))}"
 
         y = s["year"]
         ytxt = "?" if y is None else str(y)
@@ -575,6 +560,8 @@ def main():
     progress = ProgressReporter(total=len(years_to_run), every_sec=args.progress_every_sec)
     progress.start()
 
+    eta = ETATracker(alpha=0.25)
+
     processed = 0
     cum_test_rows = 0
     try:
@@ -617,6 +604,33 @@ def main():
             Xcal, ycal = X_all[cal_idx], y_all[cal_idx]
             Xte, yte = X_all[te_idx], y_all[te_idx]
 
+            total_years = len(years_to_run)
+            remaining_years_after = max(0, total_years - i)
+
+            def eta_remaining(stage: str, q_done: int = 0, pred_done: int = 0):
+                rem = {}
+                if stage == "fit_quantiles":
+                    rem["fit_quantiles"] = max(0, len(Q_LIST) - int(q_done))
+                    rem["fit_direction"] = 1
+                    rem["calibrate_conformal"] = 1
+                    rem["predict"] = 7
+                elif stage == "fit_direction":
+                    rem["fit_direction"] = 0
+                    rem["calibrate_conformal"] = 1
+                    rem["predict"] = 7
+                elif stage == "calibrate_conformal":
+                    rem["calibrate_conformal"] = 0
+                    rem["predict"] = 7
+                elif stage == "predict":
+                    rem["predict"] = max(0, 7 - int(pred_done))
+
+                if remaining_years_after:
+                    rem["fit_quantiles"] = rem.get("fit_quantiles", 0) + remaining_years_after * len(Q_LIST)
+                    rem["fit_direction"] = rem.get("fit_direction", 0) + remaining_years_after * 1
+                    rem["calibrate_conformal"] = rem.get("calibrate_conformal", 0) + remaining_years_after * 1
+                    rem["predict"] = rem.get("predict", 0) + remaining_years_after * 7
+                return rem
+
             progress.update(phase="prep")
             # Fit preprocessing once per split (prevents ad hoc row dropping and avoids duplicated work per model).
             imputer = SimpleImputer(strategy="median")
@@ -636,21 +650,43 @@ def main():
             # Quantile models
             q_jobs = min(max(1, int(args.n_jobs)), len(Q_LIST))
             if args.parallel_backend == "threading":
-                progress.update(sub_done=0, sub_total=len(Q_LIST), sub_name="q", force_print=True)
+                progress.update(
+                    sub_done=0,
+                    sub_total=len(Q_LIST),
+                    sub_name="q",
+                    eta_sec=eta.eta_seconds(eta_remaining("fit_quantiles", q_done=0)),
+                    force_print=True,
+                )
                 q_pairs = []
+                eta.start(units=len(Q_LIST))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=q_jobs) as ex:
                     futures = [ex.submit(fit_one_quantile, q, Xtr, ytr) for q in Q_LIST]
                     for k, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
                         q_pairs.append(fut.result())
-                        progress.update(sub_done=k, sub_total=len(Q_LIST), sub_name="q", force_print=True)
+                        progress.update(
+                            sub_done=k,
+                            sub_total=len(Q_LIST),
+                            sub_name="q",
+                            eta_sec=eta.eta_seconds(eta_remaining("fit_quantiles", q_done=k)),
+                            force_print=True,
+                        )
+                eta.end("fit_quantiles")
             else:
+                eta.start(units=len(Q_LIST))
                 q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
                     delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
                 )
-                progress.update(sub_done=len(Q_LIST), sub_total=len(Q_LIST), sub_name="q", force_print=True)
+                eta.end("fit_quantiles")
+                progress.update(
+                    sub_done=len(Q_LIST),
+                    sub_total=len(Q_LIST),
+                    sub_name="q",
+                    eta_sec=eta.eta_seconds(eta_remaining("fit_quantiles", q_done=len(Q_LIST))),
+                    force_print=True,
+                )
             q_models = dict(q_pairs)
 
-            progress.update(phase="fit_direction")
+            progress.update(phase="fit_direction", eta_sec=eta.eta_seconds(eta_remaining("fit_quantiles", q_done=len(Q_LIST))))
             # ---------------------------
             # Direction model (up/down) + calibration on calibration year
             # Fixes:
@@ -675,10 +711,13 @@ def main():
             )
 
             # Fit LR on TRAIN only (Xtr is already imputed+scaled).
+            eta.start()
             clf.fit(Xtr, ytr_up)
+            eta.end("fit_direction")
 
-            progress.update(phase="calibrate_conformal")
+            progress.update(phase="calibrate_conformal", eta_sec=eta.eta_seconds(eta_remaining("fit_direction")))
             # Predict on calibration for normalized conformal
+            eta.start()
             cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
 
             # Heteroskedastic scale proxy (same idea as before).
@@ -776,16 +815,32 @@ def main():
                 if alpha in qhat_bucket_hi and b in qhat_bucket_hi[alpha]:
                     return qhat_bucket_hi[alpha][b]
                 return qhat_global_hi[alpha]
+            eta.end("calibrate_conformal")
 
-            progress.update(phase="predict")
-            progress.update(sub_done=0, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
+            progress.update(phase="predict", eta_sec=eta.eta_seconds(eta_remaining("calibrate_conformal")))
+            progress.update(
+                sub_done=0,
+                sub_total=len(Q_LIST) + 2,
+                sub_name="pred",
+                eta_sec=eta.eta_seconds(eta_remaining("predict", pred_done=0)),
+                force_print=True,
+            )
             preds = {}
             for k, q in enumerate(Q_LIST, start=1):
+                eta.start()
                 preds[q] = q_models[q].predict(Xte)
-                progress.update(sub_done=k, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
+                eta.end("predict")
+                progress.update(
+                    sub_done=k,
+                    sub_total=len(Q_LIST) + 2,
+                    sub_name="pred",
+                    eta_sec=eta.eta_seconds(eta_remaining("predict", pred_done=k)),
+                    force_print=True,
+                )
 
             # Calibrate probabilities using the calibration year (Platt/sigmoid).
             # Guard against tiny samples where calibration labels collapse to 1 class.
+            eta.start()
             if np.unique(ycal_up).size >= 2:
                 min_class = int(np.min(np.bincount(ycal_up)))
                 cv_splits = min(5, min_class)
@@ -802,12 +857,20 @@ def main():
                     pup = clf.predict_proba(Xte)[:, 1]
             else:
                 pup = clf.predict_proba(Xte)[:, 1]
-            progress.update(sub_done=len(Q_LIST) + 1, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
+            eta.end("predict")
+            progress.update(
+                sub_done=len(Q_LIST) + 1,
+                sub_total=len(Q_LIST) + 2,
+                sub_name="pred",
+                eta_sec=eta.eta_seconds(eta_remaining("predict", pred_done=len(Q_LIST) + 1)),
+                force_print=True,
+            )
 
             te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
             te_bucket = bucketize(te_proxy, edges, len(yte))
 
             conf_bands = {}
+            eta.start()
             for alpha in ALPHAS:
                 pct = int((1 - alpha) * 100)
                 adj_lo = np.array([get_qhat_lo(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
@@ -815,7 +878,14 @@ def main():
 
                 conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj_lo
                 conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj_hi
-            progress.update(sub_done=len(Q_LIST) + 2, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
+            eta.end("predict")
+            progress.update(
+                sub_done=len(Q_LIST) + 2,
+                sub_total=len(Q_LIST) + 2,
+                sub_name="pred",
+                eta_sec=eta.eta_seconds(eta_remaining("predict", pred_done=7)),
+                force_print=True,
+            )
 
             out = pd.DataFrame({"Date": dates_arr[te_idx], "Ticker": tickers_arr[te_idx]})
             for q in Q_LIST:
