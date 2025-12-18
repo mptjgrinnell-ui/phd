@@ -17,14 +17,6 @@ Q_LIST = [0.05, 0.10, 0.50, 0.90, 0.95]
 ALPHAS = [0.10, 0.05]  # 90%, 95%
 
 
-def conformal_cqr(cal_y, cal_lo, cal_hi, alpha):
-    # Conformalized Quantile Regression (CQR)
-    # score = max(lo - y, y - hi)
-    s = np.maximum(cal_lo - cal_y, cal_y - cal_hi)
-    q = np.quantile(s[~np.isnan(s)], 1 - alpha)
-    return float(q)
-
-
 def make_year_slices(df, first_test_year, last_test_year):
     years = sorted(df["Date"].dt.year.unique())
     if not years:
@@ -203,13 +195,14 @@ def main():
 
         edges = make_edges(cal_proxy)
 
-        def bucketize(arr, edges_in):
+        def bucketize(arr, edges_in, n):
             if arr is None or edges_in is None:
-                return np.zeros(len(arr) if arr is not None else len(cal_s), dtype=int)
+                return np.zeros(n, dtype=int)
             breaks = edges_in[1:-1]
-            return np.digitize(arr, breaks, right=True)
+            b = np.digitize(arr, breaks, right=True)
+            return np.where(np.isnan(arr), 0, b)
 
-        cal_bucket = bucketize(cal_proxy, edges)
+        cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
 
         # Compute qhat per bucket with fallback to global
         qhat_global = {alpha: float(np.quantile(cal_s[~np.isnan(cal_s)], 1 - alpha)) for alpha in ALPHAS}
@@ -241,7 +234,7 @@ def main():
             pup = clf.predict_proba(Xte)[:, 1]
 
         te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
-        te_bucket = bucketize(te_proxy, edges)
+        te_bucket = bucketize(te_proxy, edges, len(yte))
 
         conf_bands = {}
         for alpha in ALPHAS:
