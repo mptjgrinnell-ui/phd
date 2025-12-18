@@ -1,6 +1,8 @@
 import os
 import argparse
 import time
+import hashlib
+import threading
 import numpy as np
 import pandas as pd
 import yaml
@@ -15,6 +17,60 @@ from joblib import Parallel, delayed
 
 Q_LIST = [0.05, 0.10, 0.50, 0.90, 0.95]
 ALPHAS = [0.10, 0.05]  # 90%, 95%
+SPLIT_CACHE_DIR = "data/meta/split_cache_v1"
+PREP_CACHE_DIR = "data/meta/prep_cache_v1"
+
+
+class ProgressReporter:
+    def __init__(self, total, every_sec: float = 5.0):
+        self.total = int(total)
+        self.every_sec = float(every_sec)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._state = {
+            "phase": "init",
+            "year": None,
+            "i": 0,
+            "done": 0,
+            "rows_tr": 0,
+            "rows_cal": 0,
+            "rows_te": 0,
+            "cum_test_rows": 0,
+            "start_ts": time.time(),
+        }
+
+    def start(self):
+        if self.every_sec > 0:
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def update(self, **kwargs):
+        with self._lock:
+            self._state.update(kwargs)
+
+    def _snapshot(self):
+        with self._lock:
+            return dict(self._state)
+
+    def _run(self):
+        while not self._stop.wait(self.every_sec):
+            s = self._snapshot()
+            total = max(self.total, 1)
+            pct = 100.0 * (s["i"] / total)
+            elapsed = max(1e-6, time.time() - s["start_ts"])
+            rows_rate = s["cum_test_rows"] / elapsed
+            y = s["year"]
+            ytxt = "?" if y is None else str(y)
+            print(
+                f"[progress] {pct:5.1f}% ({s['i']}/{total})  Y={ytxt}  phase={s['phase']}  "
+                f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
+                f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}"
+            )
 
 
 def make_year_slices(df, first_test_year, last_test_year):
@@ -49,6 +105,51 @@ def fit_one_quantile(q, Xtr, ytr):
     return q, m
 
 
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+
+def load_or_make_split_indices(years_arr, test_year, cache_dir=SPLIT_CACHE_DIR):
+    """
+    For test year Y:
+      train: years <= Y-2
+      cal:   years == Y-1
+      test:  years == Y
+    """
+    ensure_dir(cache_dir)
+    fp = os.path.join(cache_dir, f"splits_Y{test_year}.npz")
+
+    if os.path.exists(fp):
+        z = np.load(fp)
+        return z["tr"], z["cal"], z["te"]
+
+    tr = np.flatnonzero(years_arr <= (test_year - 2))
+    cal = np.flatnonzero(years_arr == (test_year - 1))
+    te = np.flatnonzero(years_arr == test_year)
+
+    np.savez_compressed(fp, tr=tr.astype(np.int32), cal=cal.astype(np.int32), te=te.astype(np.int32))
+    return tr, cal, te
+
+
+def load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, cache_dir=PREP_CACHE_DIR):
+    ensure_dir(cache_dir)
+    fp = os.path.join(cache_dir, f"prep_{feat_sig}_Y{Y}.npz")
+    if os.path.exists(fp):
+        z = np.load(fp)
+        return z["Xtr"], z["Xcal"], z["Xte"]
+
+    Xtr_i = imputer.fit_transform(Xtr)
+    Xcal_i = imputer.transform(Xcal)
+    Xte_i = imputer.transform(Xte)
+
+    Xtr_s = scaler.fit_transform(Xtr_i)
+    Xcal_s = scaler.transform(Xcal_i)
+    Xte_s = scaler.transform(Xte_i)
+
+    np.savez_compressed(fp, Xtr=Xtr_s, Xcal=Xcal_s, Xte=Xte_s)
+    return Xtr_s, Xcal_s, Xte_s
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Baseline walk-forward backtest.")
     p.add_argument("--backtest-cfg", default="configs/backtest.yaml")
@@ -72,6 +173,15 @@ def parse_args():
         choices=["threading", "loky"],
         help="Joblib backend; use threading to avoid large data copies on Windows.",
     )
+    p.add_argument("--cache-splits", action="store_true", help="Cache yearly split indices to disk.")
+    p.add_argument("--cache-prep", action="store_true", help="Cache imputed+scaled arrays per year (iteration speed).")
+    p.add_argument("--drop-constant-cols", action="store_true", help="Drop constant columns once (no signal loss).")
+    p.add_argument(
+        "--progress-every-sec",
+        type=float,
+        default=5.0,
+        help="Print a progress heartbeat every N seconds (0 disables).",
+    )
     return p.parse_args()
 
 
@@ -88,12 +198,13 @@ def main():
 
     panel = pd.read_parquet(fcfg["panel_out"])
     panel["Date"] = pd.to_datetime(panel["Date"])
-    panel = panel.sort_values(["Date", "Ticker"])
+    panel = panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     panel = panel.dropna(axis=1, how="all")
 
     if args.sample_tickers:
         keep = sorted(panel["Ticker"].unique())[: args.sample_tickers]
         panel = panel[panel["Ticker"].isin(keep)]
+        panel = panel.reset_index(drop=True)
         print(f"Sampling {len(keep)} tickers for fast run: {keep}")
 
     drop = {"Date", "Ticker", "r_t1"}
@@ -101,175 +212,228 @@ def main():
 
     # Require target present; features are imputed downstream.
     panel = panel.dropna(subset=["r_t1"])
-    years_arr = panel["Date"].dt.year.to_numpy()
+    panel = panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
+
+    # --- FAST ARRAYS (convert once) ---
+    years_arr = panel["Date"].dt.year.to_numpy(np.int16)
+    dates_arr = panel["Date"].to_numpy()
+    tickers_arr = panel["Ticker"].to_numpy()
+
+    # Feature matrix + target as float32 (faster + less RAM).
+    X_all = panel[feat_cols].to_numpy(dtype=np.float32, copy=False)
+    y_all = panel["r_t1"].to_numpy(dtype=np.float32, copy=False)
+
+    # Optional: drop constant columns once (no signal loss).
+    if args.drop_constant_cols:
+        stds = np.nanstd(X_all, axis=0)
+        keep_mask = stds > 0
+        if not np.all(keep_mask):
+            dropped = int(np.sum(~keep_mask))
+            feat_cols = [c for c, k in zip(feat_cols, keep_mask) if k]
+            X_all = X_all[:, keep_mask]
+            print(f"Dropped {dropped} constant cols; remaining={len(feat_cols)}")
+
+    feat_sig = hashlib.sha1(("|".join(feat_cols)).encode("utf-8")).hexdigest()[:10]
+
+    # Proxies for Mondrian bucketing (precompute once, if available).
+    proxy_vix_absret1 = None
+    proxy_spy_range_std21 = None
+    proxy_own_range_std21 = None
+    if "CTX_^VIX_ret_1" in panel.columns:
+        proxy_vix_absret1 = np.abs(panel["CTX_^VIX_ret_1"].to_numpy(dtype=np.float32, copy=False))
+    if "CTX_SPY_range_std_21" in panel.columns:
+        proxy_spy_range_std21 = panel["CTX_SPY_range_std_21"].to_numpy(dtype=np.float32, copy=False)
+    if "range_std_21" in panel.columns:
+        proxy_own_range_std21 = panel["range_std_21"].to_numpy(dtype=np.float32, copy=False)
 
     first_test_year = bcfg["walk_forward"]["first_test_year"]
     last_test_year = bcfg["walk_forward"]["last_test_year"]
 
     tape_rows = []
 
+    years_to_run = list(make_year_slices(panel, first_test_year, last_test_year))
+    if max_years is not None:
+        years_to_run = years_to_run[: int(max_years)]
+
+    progress = ProgressReporter(total=len(years_to_run), every_sec=args.progress_every_sec)
+    progress.start()
+
     processed = 0
-    for Y in make_year_slices(panel, first_test_year, last_test_year):
-        train_end = Y - 2
-        cal_year = Y - 1
-        test_year = Y
+    cum_test_rows = 0
+    try:
+        for i, Y in enumerate(years_to_run, start=1):
+            train_end = Y - 2
+            cal_year = Y - 1
+            test_year = Y
+            progress.update(i=i, year=Y, phase="split")
 
-        train_mask = years_arr <= train_end
-        cal_mask = years_arr == cal_year
-        test_mask = years_arr == test_year
+            if args.cache_splits:
+                tr_idx, cal_idx, te_idx = load_or_make_split_indices(years_arr, Y)
+            else:
+                tr_idx = np.flatnonzero(years_arr <= train_end)
+                cal_idx = np.flatnonzero(years_arr == cal_year)
+                te_idx = np.flatnonzero(years_arr == test_year)
 
-        train = panel[train_mask]
-        cal = panel[cal_mask]
-        test = panel[test_mask]
-
-        if len(train) < 10000 or len(cal) < 1000 or len(test) < 1000:
-            continue
-
-        t0 = time.perf_counter()
-        Xtr_df, ytr = train[feat_cols], train["r_t1"].to_numpy()
-        Xcal_df, ycal = cal[feat_cols], cal["r_t1"].to_numpy()
-        Xte_df, yte = test[feat_cols], test["r_t1"].to_numpy()
-
-        # Fit preprocessing once per split (prevents ad hoc row dropping and avoids duplicated work per model).
-        imputer = SimpleImputer(strategy="median")
-        Xtr_imp = imputer.fit_transform(Xtr_df)
-        Xcal_imp = imputer.transform(Xcal_df)
-        Xte_imp = imputer.transform(Xte_df)
-
-        scaler = make_scaler()
-        Xtr = scaler.fit_transform(Xtr_imp)
-        Xcal = scaler.transform(Xcal_imp)
-        Xte = scaler.transform(Xte_imp)
-
-        # Quantile models
-        q_jobs = min(max(1, int(args.n_jobs)), len(Q_LIST))
-        q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
-            delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
-        )
-        q_models = dict(q_pairs)
-
-        # Direction model (up/down) + calibration on the calibration year
-        ytr_up = (ytr > 0).astype(int)
-        ycal_up = (ycal > 0).astype(int)
-
-        clf = LogisticRegression(
-            solver="saga",
-            penalty="l2",
-            C=1.0,
-            max_iter=2000,
-            tol=1e-4,
-            n_jobs=-1,
-            random_state=42,
-        )
-        clf.fit(Xtr, ytr_up)
-
-        # Predict on calibration for normalized conformal
-        cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
-        cal_sigma = np.maximum(1e-6, 0.5 * (cal_q[0.90] - cal_q[0.10]))
-        cal_s = np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma
-
-        # Mondrian buckets via volatility proxy
-        def pick_proxy(df_slice):
-            if "CTX_^VIX_ret_1" in df_slice:
-                return np.abs(df_slice["CTX_^VIX_ret_1"].to_numpy())
-            if "CTX_SPY_range_std_21" in df_slice:
-                return df_slice["CTX_SPY_range_std_21"].to_numpy()
-            if "range_std_21" in df_slice:
-                return df_slice["range_std_21"].to_numpy()
-            return None
-
-        cal_proxy = pick_proxy(cal)
-        te_proxy = pick_proxy(test)
-
-        def make_edges(proxy_arr, n_bins=4):
-            if proxy_arr is None:
-                return None
-            vals = proxy_arr[~np.isnan(proxy_arr)]
-            if len(vals) < 100:
-                return None
-            qs = np.quantile(vals, [0, 0.25, 0.5, 0.75, 1.0])
-            edges = np.unique(qs)
-            if len(edges) < 3:
-                return None
-            return edges
-
-        edges = make_edges(cal_proxy)
-
-        def bucketize(arr, edges_in, n):
-            if arr is None or edges_in is None:
-                return np.zeros(n, dtype=int)
-            breaks = edges_in[1:-1]
-            b = np.digitize(arr, breaks, right=True)
-            b = np.where(np.isnan(arr), 0, b)
-            return np.clip(b, 0, len(breaks)).astype(int)
-
-        cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
-
-        # Compute qhat per bucket with fallback to global
-        qhat_global = {alpha: float(np.quantile(cal_s[~np.isnan(cal_s)], 1 - alpha)) for alpha in ALPHAS}
-        qhat_bucket = {}
-        for b in np.unique(cal_bucket):
-            mask = cal_bucket == b
-            scores_b = cal_s[mask]
-            if scores_b.size == 0 or np.all(np.isnan(scores_b)):
+            progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
+            if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
+                progress.update(phase="skip_small")
                 continue
+
+            t0 = time.perf_counter()
+            Xtr, ytr = X_all[tr_idx], y_all[tr_idx]
+            Xcal, ycal = X_all[cal_idx], y_all[cal_idx]
+            Xte, yte = X_all[te_idx], y_all[te_idx]
+
+            progress.update(phase="prep")
+            # Fit preprocessing once per split (prevents ad hoc row dropping and avoids duplicated work per model).
+            imputer = SimpleImputer(strategy="median")
+            scaler = make_scaler()
+            if args.cache_prep:
+                Xtr, Xcal, Xte = load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig)
+            else:
+                Xtr_imp = imputer.fit_transform(Xtr)
+                Xcal_imp = imputer.transform(Xcal)
+                Xte_imp = imputer.transform(Xte)
+
+                Xtr = scaler.fit_transform(Xtr_imp)
+                Xcal = scaler.transform(Xcal_imp)
+                Xte = scaler.transform(Xte_imp)
+
+            progress.update(phase="fit_quantiles")
+            # Quantile models
+            q_jobs = min(max(1, int(args.n_jobs)), len(Q_LIST))
+            q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
+                delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
+            )
+            q_models = dict(q_pairs)
+
+            progress.update(phase="fit_direction")
+            # Direction model (up/down) + calibration on the calibration year
+            ytr_up = (ytr > 0).astype(int)
+            ycal_up = (ycal > 0).astype(int)
+
+            clf = LogisticRegression(
+                solver="saga",
+                penalty="l2",
+                C=1.0,
+                max_iter=2000,
+                tol=1e-4,
+                n_jobs=-1,
+                random_state=42,
+            )
+            clf.fit(Xtr, ytr_up)
+
+            progress.update(phase="calibrate_conformal")
+            # Predict on calibration for normalized conformal
+            cal_q = {q: q_models[q].predict(Xcal) for q in Q_LIST}
+            cal_sigma = np.maximum(1e-6, 0.5 * (cal_q[0.90] - cal_q[0.10]))
+            cal_s = np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma
+
+            # Mondrian buckets via volatility proxy (precomputed once, then indexed).
+            cal_proxy = None
+            te_proxy = None
+            if proxy_vix_absret1 is not None:
+                cal_proxy = proxy_vix_absret1[cal_idx]
+                te_proxy = proxy_vix_absret1[te_idx]
+            elif proxy_spy_range_std21 is not None:
+                cal_proxy = proxy_spy_range_std21[cal_idx]
+                te_proxy = proxy_spy_range_std21[te_idx]
+            elif proxy_own_range_std21 is not None:
+                cal_proxy = proxy_own_range_std21[cal_idx]
+                te_proxy = proxy_own_range_std21[te_idx]
+
+            def make_edges(proxy_arr, n_bins=4):
+                if proxy_arr is None:
+                    return None
+                vals = proxy_arr[~np.isnan(proxy_arr)]
+                if len(vals) < 100:
+                    return None
+                qs = np.quantile(vals, [0, 0.25, 0.5, 0.75, 1.0])
+                edges = np.unique(qs)
+                if len(edges) < 3:
+                    return None
+                return edges
+
+            edges = make_edges(cal_proxy)
+
+            def bucketize(arr, edges_in, n):
+                if arr is None or edges_in is None:
+                    return np.zeros(n, dtype=int)
+                breaks = edges_in[1:-1]
+                b = np.digitize(arr, breaks, right=True)
+                b = np.where(np.isnan(arr), 0, b)
+                return np.clip(b, 0, len(breaks)).astype(int)
+
+            cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
+
+            # Compute qhat per bucket with fallback to global
+            qhat_global = {alpha: float(np.quantile(cal_s[~np.isnan(cal_s)], 1 - alpha)) for alpha in ALPHAS}
+            qhat_bucket = {}
+            for b in np.unique(cal_bucket):
+                mask = cal_bucket == b
+                scores_b = cal_s[mask]
+                if scores_b.size == 0 or np.all(np.isnan(scores_b)):
+                    continue
+                for alpha in ALPHAS:
+                    qhat_bucket.setdefault(alpha, {})
+                    qhat_bucket[alpha][b] = float(np.quantile(scores_b[~np.isnan(scores_b)], 1 - alpha))
+
+            def get_qhat(alpha, b):
+                if alpha in qhat_bucket and b in qhat_bucket[alpha]:
+                    return qhat_bucket[alpha][b]
+                return qhat_global[alpha]
+
+            progress.update(phase="predict")
+            preds = {q: q_models[q].predict(Xte) for q in Q_LIST}
+
+            # Calibrate probabilities using the calibration year (Platt/sigmoid).
+            # Guard against tiny samples where calibration labels collapse to 1 class.
+            if np.unique(ycal_up).size >= 2:
+                cal_clf = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
+                cal_clf.fit(Xcal, ycal_up)
+                pup = cal_clf.predict_proba(Xte)[:, 1]
+            else:
+                pup = clf.predict_proba(Xte)[:, 1]
+
+            te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
+            te_bucket = bucketize(te_proxy, edges, len(yte))
+
+            conf_bands = {}
             for alpha in ALPHAS:
-                qhat_bucket.setdefault(alpha, {})
-                qhat_bucket[alpha][b] = float(np.quantile(scores_b[~np.isnan(scores_b)], 1 - alpha))
+                pct = int((1 - alpha) * 100)
+                adj = np.array([get_qhat(alpha, b) for b in te_bucket]) * te_sigma
+                conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj
+                conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj
 
-        def get_qhat(alpha, b):
-            if alpha in qhat_bucket and b in qhat_bucket[alpha]:
-                return qhat_bucket[alpha][b]
-            return qhat_global[alpha]
+            out = pd.DataFrame({"Date": dates_arr[te_idx], "Ticker": tickers_arr[te_idx]})
+            for q in Q_LIST:
+                out[f"q{int(q * 100):02d}"] = preds[q]
+            out["p_up"] = pup
+            for k, v in conf_bands.items():
+                out[k] = v
+            out["realized_r1"] = yte
+            out["test_year"] = Y
+            tape_rows.append(out)
 
-        # Predict on test
-        preds = {q: q_models[q].predict(Xte) for q in Q_LIST}
+            mae = mean_absolute_error(yte, preds[0.50])
+            cov90 = np.mean((yte >= conf_bands["conf90_lo"]) & (yte <= conf_bands["conf90_hi"]))
+            cov95 = np.mean((yte >= conf_bands["conf95_lo"]) & (yte <= conf_bands["conf95_hi"]))
+            exc05 = np.mean(yte < preds[0.05])
+            exc95 = np.mean(yte > preds[0.95])
+            dt = time.perf_counter() - t0
+            print(
+                f"Y={Y}  MAE(med)={mae:.6f}  cov90={cov90:.3f}  cov95={cov95:.3f}  "
+                f"exc05={exc05:.3f}  exc95={exc95:.3f}  rows(tr/cal/te)={len(tr_idx)}/{len(cal_idx)}/{len(te_idx)}  "
+                f"secs={dt:.1f}  jobs={q_jobs}/{args.parallel_backend}"
+            )
 
-        # Calibrate probabilities using the calibration year (Platt/sigmoid).
-        # Guard against tiny samples where calibration labels collapse to 1 class.
-        if np.unique(ycal_up).size >= 2:
-            cal_clf = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
-            cal_clf.fit(Xcal, ycal_up)
-            pup = cal_clf.predict_proba(Xte)[:, 1]
-        else:
-            pup = clf.predict_proba(Xte)[:, 1]
+            processed += 1
+            cum_test_rows += len(te_idx)
+            progress.update(phase="done_year", cum_test_rows=cum_test_rows)
 
-        te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
-        te_bucket = bucketize(te_proxy, edges, len(yte))
-
-        conf_bands = {}
-        for alpha in ALPHAS:
-            pct = int((1 - alpha) * 100)
-            adj = np.array([get_qhat(alpha, b) for b in te_bucket]) * te_sigma
-            conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj
-            conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj
-
-        out = test[["Date", "Ticker"]].copy()
-        for q in Q_LIST:
-            out[f"q{int(q * 100):02d}"] = preds[q]
-        out["p_up"] = pup
-        for k, v in conf_bands.items():
-            out[k] = v
-        out["realized_r1"] = yte
-        out["test_year"] = Y
-        tape_rows.append(out)
-
-        # Quick console metrics (per year)
-        mae = mean_absolute_error(yte, preds[0.50])
-        cov90 = np.mean((yte >= conf_bands["conf90_lo"]) & (yte <= conf_bands["conf90_hi"]))
-        cov95 = np.mean((yte >= conf_bands["conf95_lo"]) & (yte <= conf_bands["conf95_hi"]))
-        exc05 = np.mean(yte < preds[0.05])
-        exc95 = np.mean(yte > preds[0.95])
-        dt = time.perf_counter() - t0
-        print(
-            f"Y={Y}  MAE(med)={mae:.6f}  cov90={cov90:.3f}  cov95={cov95:.3f}  "
-            f"exc05={exc05:.3f}  exc95={exc95:.3f}  rows(tr/cal/te)={len(train)}/{len(cal)}/{len(test)}  "
-            f"secs={dt:.1f}  jobs={q_jobs}/{args.parallel_backend}"
-        )
-        processed += 1
-        if max_years is not None and processed >= max_years:
-            print(f"Reached max_years={max_years}, stopping early.")
-            break
+        progress.update(phase="done_all", cum_test_rows=cum_test_rows)
+    finally:
+        progress.stop()
 
     if not tape_rows:
         print("No valid walk-forward slices produced; check data coverage.")

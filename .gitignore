@@ -8,3 +8,7 @@ __pycache__/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# Generated caches
+data/meta/split_cache_v*/
+data/meta/prep_cache_v*/
