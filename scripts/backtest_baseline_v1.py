@@ -877,18 +877,6 @@ def main():
             # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
             cal_s = np.maximum(0.0, np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma)
 
-            def make_edges(proxy_arr, n_bins=4):
-                if proxy_arr is None:
-                    return None
-                vals = proxy_arr[~np.isnan(proxy_arr)]
-                if len(vals) < 100:
-                    return None
-                qs = np.quantile(vals, np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1))
-                edges = np.unique(qs)
-                if len(edges) < 3:
-                    return None
-                return edges
-
             n_buckets_default = int(bcfg.get("conformal", {}).get("n_buckets", 4))
             n_buckets = int(args.regime_buckets) if args.regime_buckets is not None else int(args.n_buckets or n_buckets_default)
 
@@ -915,16 +903,6 @@ def main():
             breaks = make_breaks(cal_proxy, n_buckets)
             cal_bucket = bucketize(cal_proxy, breaks, len(cal_s))
             te_bucket = bucketize(te_proxy, breaks, len(yte))
-
-            def bucketize(arr, edges_in, n):
-                if arr is None or edges_in is None:
-                    return np.zeros(n, dtype=int)
-                breaks = edges_in[1:-1]
-                b = np.digitize(arr, breaks, right=True)
-                b = np.where(np.isnan(arr), 0, b)
-                return np.clip(b, 0, len(breaks)).astype(int)
-
-            cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
 
             # Global fallback quantiles (CQR score).
             qhat_global = {alpha: conformal_qhat(cal_s, alpha) for alpha in ALPHAS}
