@@ -41,6 +41,7 @@ class ProgressReporter:
         "done_all": PHASE_STEPS,
         "no_valid_years": 0,
     }
+    _SPIN = "|/-\\"
 
     def __init__(self, total, every_sec: float = 5.0):
         self.total = int(total)
@@ -53,13 +54,16 @@ class ProgressReporter:
             "year": None,
             "i": 0,
             "phase_step": 0,
-            "q_done": 0,
-            "q_total": 0,
+            "sub_done": 0,
+            "sub_total": 0,
+            "sub_name": "",
             "rows_tr": 0,
             "rows_cal": 0,
             "rows_te": 0,
             "cum_test_rows": 0,
             "start_ts": time.time(),
+            "last_event_ts": time.time(),
+            "spin_i": 0,
         }
 
     def start(self):
@@ -72,56 +76,91 @@ class ProgressReporter:
             self._thread.join(timeout=1.0)
 
     def update(self, **kwargs):
+        force_print = bool(kwargs.pop("force_print", False))
+        event = bool(kwargs.pop("event", False))
+
         with self._lock:
             if "phase" in kwargs and "phase_step" not in kwargs:
                 phase = kwargs["phase"]
                 kwargs["phase_step"] = self.PHASE_TO_STEP.get(phase, 0)
+
+                # Default sub-progress per phase (override by passing sub_* explicitly).
                 if phase == "fit_quantiles":
-                    kwargs.setdefault("q_total", len(Q_LIST))
-                    kwargs.setdefault("q_done", 0)
+                    kwargs.setdefault("sub_total", len(Q_LIST))
+                    kwargs.setdefault("sub_done", 0)
+                    kwargs.setdefault("sub_name", "q")
+                elif phase == "predict":
+                    kwargs.setdefault("sub_total", len(Q_LIST) + 2)  # quantiles + p_up + bands
+                    kwargs.setdefault("sub_done", 0)
+                    kwargs.setdefault("sub_name", "pred")
                 else:
-                    kwargs.setdefault("q_total", 0)
-                    kwargs.setdefault("q_done", 0)
+                    kwargs.setdefault("sub_total", 0)
+                    kwargs.setdefault("sub_done", 0)
+                    kwargs.setdefault("sub_name", "")
+
+            if force_print or event:
+                kwargs["last_event_ts"] = time.time()
+
             self._state.update(kwargs)
+
+        if force_print:
+            self.print_now()
 
     def _snapshot(self):
         with self._lock:
             return dict(self._state)
 
+    def _next_spin(self, s: dict):
+        with self._lock:
+            self._state["spin_i"] = int(self._state.get("spin_i", 0)) + 1
+            return self._SPIN[self._state["spin_i"] % len(self._SPIN)]
+
+    def _format_line(self, s: dict, spin: str):
+        total_years = max(self.total, 1)
+        year_i = int(s.get("i", 0))
+        years_done = min(max(year_i - 1, 0), total_years)
+
+        phase_step = int(s.get("phase_step", 0))
+        phase_step = min(max(phase_step, 0), self.PHASE_STEPS)
+
+        sub_total = int(s.get("sub_total", 0))
+        sub_done = int(s.get("sub_done", 0))
+        sub_name = str(s.get("sub_name", ""))
+        if sub_total > 0:
+            sub_frac = min(max(sub_done / max(sub_total, 1), 0.0), 1.0)
+        else:
+            sub_frac = 0.0
+
+        year_frac = min(max((phase_step + sub_frac) / max(self.PHASE_STEPS, 1), 0.0), 1.0)
+        pct = 100.0 * ((years_done + year_frac) / total_years)
+
+        now = time.time()
+        elapsed = max(1e-6, now - s["start_ts"])
+        since_evt = max(0.0, now - float(s.get("last_event_ts", s["start_ts"])))
+        rows_rate = s["cum_test_rows"] / elapsed
+        y = s["year"]
+        ytxt = "?" if y is None else str(y)
+        subtxt = ""
+        if sub_total > 0 and sub_name:
+            subtxt = f"  {sub_name}={sub_done}/{sub_total}"
+        return (
+            f"{spin} [progress] {pct:5.1f}% (year {min(max(year_i, 0), total_years)}/{total_years})  "
+            f"Y={ytxt}  phase={s['phase']}{subtxt}  "
+            f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
+            f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}  "
+            f"t={elapsed:,.0f}s  idle={since_evt:,.0f}s"
+        )
+
+    def print_now(self):
+        s = self._snapshot()
+        spin = self._next_spin(s)
+        print(self._format_line(s, spin), flush=True)
+
     def _run(self):
         while not self._stop.wait(self.every_sec):
             s = self._snapshot()
-            total_years = max(self.total, 1)
-            year_i = int(s.get("i", 0))
-            years_done = min(max(year_i - 1, 0), total_years)
-
-            phase_step = int(s.get("phase_step", 0))
-            phase_step = min(max(phase_step, 0), self.PHASE_STEPS)
-
-            q_total = int(s.get("q_total", 0))
-            q_done = int(s.get("q_done", 0))
-            if q_total > 0:
-                sub_frac = min(max(q_done / max(q_total, 1), 0.0), 1.0)
-            else:
-                sub_frac = 0.0
-
-            year_frac = min(max((phase_step + sub_frac) / max(self.PHASE_STEPS, 1), 0.0), 1.0)
-            pct = 100.0 * ((years_done + year_frac) / total_years)
-            elapsed = max(1e-6, time.time() - s["start_ts"])
-            rows_rate = s["cum_test_rows"] / elapsed
-            y = s["year"]
-            ytxt = "?" if y is None else str(y)
-            qtxt = ""
-            if s.get("phase") == "fit_quantiles" and q_total > 0:
-                qtxt = f"  q={q_done}/{q_total}"
-            print(
-                f"[progress] {pct:5.1f}% (year {min(max(year_i, 0), total_years)}/{total_years})  "
-                f"Y={ytxt}  phase={s['phase']}{qtxt}  "
-                f"rows(tr/cal/te)={s['rows_tr']}/{s['rows_cal']}/{s['rows_te']}  "
-                f"cum_te={s['cum_test_rows']}  te_rows/s={rows_rate:,.1f}"
-                ,
-                flush=True,
-            )
+            spin = self._next_spin(s)
+            print(self._format_line(s, spin), flush=True)
 
 
 def make_year_slices(df, first_test_year, last_test_year):
@@ -411,18 +450,18 @@ def main():
             # Quantile models
             q_jobs = min(max(1, int(args.n_jobs)), len(Q_LIST))
             if args.parallel_backend == "threading":
-                progress.update(q_done=0, q_total=len(Q_LIST))
+                progress.update(sub_done=0, sub_total=len(Q_LIST), sub_name="q", force_print=True)
                 q_pairs = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=q_jobs) as ex:
                     futures = [ex.submit(fit_one_quantile, q, Xtr, ytr) for q in Q_LIST]
                     for k, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
                         q_pairs.append(fut.result())
-                        progress.update(q_done=k, q_total=len(Q_LIST))
+                        progress.update(sub_done=k, sub_total=len(Q_LIST), sub_name="q", force_print=True)
             else:
                 q_pairs = Parallel(n_jobs=q_jobs, backend=args.parallel_backend)(
                     delayed(fit_one_quantile)(q, Xtr, ytr) for q in Q_LIST
                 )
-                progress.update(q_done=len(Q_LIST), q_total=len(Q_LIST))
+                progress.update(sub_done=len(Q_LIST), sub_total=len(Q_LIST), sub_name="q", force_print=True)
             q_models = dict(q_pairs)
 
             progress.update(phase="fit_direction")
@@ -513,7 +552,11 @@ def main():
                 return qhat_global[alpha]
 
             progress.update(phase="predict")
-            preds = {q: q_models[q].predict(Xte) for q in Q_LIST}
+            progress.update(sub_done=0, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
+            preds = {}
+            for k, q in enumerate(Q_LIST, start=1):
+                preds[q] = q_models[q].predict(Xte)
+                progress.update(sub_done=k, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
 
             # Calibrate probabilities using the calibration year (Platt/sigmoid).
             # Guard against tiny samples where calibration labels collapse to 1 class.
@@ -533,6 +576,7 @@ def main():
                     pup = clf.predict_proba(Xte)[:, 1]
             else:
                 pup = clf.predict_proba(Xte)[:, 1]
+            progress.update(sub_done=len(Q_LIST) + 1, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
 
             te_sigma = np.maximum(1e-6, 0.5 * (preds[0.90] - preds[0.10]))
             te_bucket = bucketize(te_proxy, edges, len(yte))
@@ -543,6 +587,7 @@ def main():
                 adj = np.array([get_qhat(alpha, b) for b in te_bucket]) * te_sigma
                 conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj
                 conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj
+            progress.update(sub_done=len(Q_LIST) + 2, sub_total=len(Q_LIST) + 2, sub_name="pred", force_print=True)
 
             out = pd.DataFrame({"Date": dates_arr[te_idx], "Ticker": tickers_arr[te_idx]})
             for q in Q_LIST:
