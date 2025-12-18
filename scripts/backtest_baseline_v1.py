@@ -156,7 +156,15 @@ def load_or_make_preprocessed(Y, Xtr, Xcal, Xte, imputer, scaler, feat_sig, spli
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Baseline walk-forward backtest.")
+    p = argparse.ArgumentParser(
+        description="Baseline walk-forward backtest.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Run C (shortest valid run):\n"
+            "  python scripts/backtest_baseline_v1.py --sample-tickers 10 --sample-seed 42 "
+            "--max-years 1 --n-jobs 5 --parallel-backend threading\n"
+        ),
+    )
     p.add_argument("--backtest-cfg", default="configs/backtest.yaml")
     p.add_argument("--features-cfg", default="configs/features.yaml")
     p.add_argument("--max-years", type=int, default=None, help="Limit number of test years processed.")
@@ -164,7 +172,13 @@ def parse_args():
         "--sample-tickers",
         type=int,
         default=None,
-        help="If set, keep only the first N tickers (alphabetical) to speed smoke-tests.",
+        help="If set, keep only N randomly sampled tickers to speed smoke-tests.",
+    )
+    p.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="RNG seed for --sample-tickers random sampling.",
     )
     p.add_argument(
         "--n-jobs",
@@ -206,12 +220,6 @@ def main():
     panel = panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     panel = panel.dropna(axis=1, how="all")
 
-    if args.sample_tickers:
-        keep = sorted(panel["Ticker"].unique())[: args.sample_tickers]
-        panel = panel[panel["Ticker"].isin(keep)]
-        panel = panel.reset_index(drop=True)
-        print(f"Sampling {len(keep)} tickers for fast run: {keep}")
-
     drop = {"Date", "Ticker", "r_t1"}
     feat_cols = [c for c in panel.columns if c not in drop]
 
@@ -227,6 +235,27 @@ def main():
     # Feature matrix + target as float32 (faster + less RAM).
     X_all = panel[feat_cols].to_numpy(dtype=np.float32, copy=False)
     y_all = panel["r_t1"].to_numpy(dtype=np.float32, copy=False)
+
+    # --- optional ticker subsample (random, seeded) ---
+    if args.sample_tickers is not None:
+        rng = np.random.default_rng(args.sample_seed)
+
+        uniq = np.unique(tickers_arr)
+        if args.sample_tickers >= len(uniq):
+            chosen = set(uniq.tolist())
+        else:
+            chosen = set(rng.choice(uniq, size=args.sample_tickers, replace=False).tolist())
+
+        keep_mask = np.isin(tickers_arr, list(chosen))
+
+        # IMPORTANT: keep arrays aligned
+        years_arr = years_arr[keep_mask]
+        dates_arr = dates_arr[keep_mask]
+        tickers_arr = tickers_arr[keep_mask]
+        X_all = X_all[keep_mask]
+        y_all = y_all[keep_mask]
+
+        print(f"Sampled {len(chosen)} tickers (seed={args.sample_seed}).")
 
     # Optional: drop constant columns once (no signal loss).
     if args.drop_constant_cols:
