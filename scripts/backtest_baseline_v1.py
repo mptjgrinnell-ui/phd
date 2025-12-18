@@ -3,6 +3,7 @@ import sys
 import argparse
 import atexit
 import time
+import warnings
 import hashlib
 import threading
 import concurrent.futures
@@ -14,6 +15,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
@@ -72,6 +74,22 @@ class ETATracker:
             per = self.ema.get(stage, self.defaults.get(stage, 1.0))
             eta += float(per) * float(rem_units)
         return float(max(0.0, eta))
+
+
+def conformal_qhat(scores: np.ndarray, alpha: float, default: float = 0.0) -> float:
+    """
+    Finite-sample conformal quantile:
+      q = k-th order statistic where k = ceil((n+1)*(1-alpha))
+    Uses partition (O(n)) and clips at 0 so we never shrink bands.
+    """
+    v = scores[np.isfinite(scores)]
+    if v.size == 0:
+        return float(default)
+    v = np.maximum(0.0, v)
+    n = int(v.size)
+    k = int(np.ceil((n + 1) * (1.0 - float(alpha))))  # 1..n+1
+    k = min(max(k, 1), n)
+    return float(np.partition(v, k - 1)[k - 1])
 
 
 def _setup_run_logging(log_dir="log", base_name="log"):
@@ -699,20 +717,24 @@ def main():
 
             USE_CLASS_BALANCE = True
 
-            clf = LogisticRegression(
-                solver="saga",
-                penalty="l2",
-                C=0.2,
-                max_iter=5000,
-                tol=1e-4,
-                n_jobs=-1,
-                random_state=42,
-                class_weight=("balanced" if USE_CLASS_BALANCE else None),
-            )
-
-            # Fit LR on TRAIN only (Xtr is already imputed+scaled).
+            # Fit LR on TRAIN only, retry once if it doesn't converge.
             eta.start()
-            clf.fit(Xtr, ytr_up)
+            for max_iter, tol, C in [(5000, 1e-4, 0.2), (20000, 1e-3, 0.1)]:
+                clf = LogisticRegression(
+                    solver="saga",
+                    penalty="l2",
+                    C=C,
+                    max_iter=max_iter,
+                    tol=tol,
+                    n_jobs=-1,
+                    random_state=42,
+                    class_weight=("balanced" if USE_CLASS_BALANCE else None),
+                )
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.filterwarnings("always", category=ConvergenceWarning)
+                    clf.fit(Xtr, ytr_up)
+                if not any(isinstance(wi.message, ConvergenceWarning) for wi in w):
+                    break
             eta.end("fit_direction")
 
             progress.update(phase="calibrate_conformal", eta_sec=eta.eta_seconds(eta_remaining("fit_direction")))
@@ -723,11 +745,9 @@ def main():
             # Heteroskedastic scale proxy (same idea as before).
             cal_sigma = np.maximum(1e-6, 0.5 * (cal_q[0.90] - cal_q[0.10]))
 
-            # Two-sided (asymmetric) normalized nonconformity scores.
-            cal_s_lo = (cal_q[0.05] - ycal) / cal_sigma  # lower tail shortfall
-            cal_s_hi = (ycal - cal_q[0.95]) / cal_sigma  # upper tail shortfall
-            cal_s_lo = np.maximum(0.0, cal_s_lo)
-            cal_s_hi = np.maximum(0.0, cal_s_hi)
+            # Two-sided CQR normalized nonconformity score (single score).
+            # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
+            cal_s = np.maximum(0.0, np.maximum(cal_q[0.05] - ycal, ycal - cal_q[0.95]) / cal_sigma)
 
             # Mondrian buckets via volatility proxy (precomputed once, then indexed).
             # Prefer a regime proxy that represents "state" (level/realized vol), not just a noisy 1-day move.
@@ -771,50 +791,22 @@ def main():
                 b = np.where(np.isnan(arr), 0, b)
                 return np.clip(b, 0, len(breaks)).astype(int)
 
-            cal_bucket = bucketize(cal_proxy, edges, len(cal_s_lo))
+            cal_bucket = bucketize(cal_proxy, edges, len(cal_s))
 
-            def _qhat(arr, alpha, default=0.0):
-                v = arr[~np.isnan(arr)]
-                if v.size == 0:
-                    return float(default)
-                return float(np.quantile(v, 1 - alpha))
+            # Global fallback quantiles (CQR score).
+            qhat_global = {alpha: conformal_qhat(cal_s, alpha) for alpha in ALPHAS}
 
-            # Global fallback quantiles (two-sided).
-            qhat_global_lo = {alpha: _qhat(cal_s_lo, alpha) for alpha in ALPHAS}
-            qhat_global_hi = {alpha: _qhat(cal_s_hi, alpha) for alpha in ALPHAS}
-
-            # Bucketed quantiles (two-sided).
-            qhat_bucket_lo = {}
-            qhat_bucket_hi = {}
-
+            # Bucketed quantiles (Mondrian by regime).
+            qhat_bucket = {alpha: {} for alpha in ALPHAS}
             for b in np.unique(cal_bucket):
                 mask = cal_bucket == b
-
-                s_lo_b = cal_s_lo[mask]
-                s_hi_b = cal_s_hi[mask]
-
-                if s_lo_b.size == 0 or np.all(np.isnan(s_lo_b)):
-                    s_lo_b = None
-                if s_hi_b.size == 0 or np.all(np.isnan(s_hi_b)):
-                    s_hi_b = None
-
+                s_b = cal_s[mask]
                 for alpha in ALPHAS:
-                    if s_lo_b is not None:
-                        qhat_bucket_lo.setdefault(alpha, {})
-                        qhat_bucket_lo[alpha][b] = _qhat(s_lo_b, alpha, default=qhat_global_lo[alpha])
-                    if s_hi_b is not None:
-                        qhat_bucket_hi.setdefault(alpha, {})
-                        qhat_bucket_hi[alpha][b] = _qhat(s_hi_b, alpha, default=qhat_global_hi[alpha])
+                    qhat_bucket[alpha][int(b)] = conformal_qhat(s_b, alpha, default=qhat_global[alpha])
 
-            def get_qhat_lo(alpha, b):
-                if alpha in qhat_bucket_lo and b in qhat_bucket_lo[alpha]:
-                    return qhat_bucket_lo[alpha][b]
-                return qhat_global_lo[alpha]
-
-            def get_qhat_hi(alpha, b):
-                if alpha in qhat_bucket_hi and b in qhat_bucket_hi[alpha]:
-                    return qhat_bucket_hi[alpha][b]
-                return qhat_global_hi[alpha]
+            def get_qhat(alpha, b):
+                b = int(b)
+                return qhat_bucket.get(alpha, {}).get(b, qhat_global[alpha])
             eta.end("calibrate_conformal")
 
             progress.update(phase="predict", eta_sec=eta.eta_seconds(eta_remaining("calibrate_conformal")))
@@ -873,11 +865,10 @@ def main():
             eta.start()
             for alpha in ALPHAS:
                 pct = int((1 - alpha) * 100)
-                adj_lo = np.array([get_qhat_lo(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
-                adj_hi = np.array([get_qhat_hi(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
+                adj = np.array([get_qhat(alpha, b) for b in te_bucket], dtype=np.float32) * te_sigma
 
-                conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj_lo
-                conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj_hi
+                conf_bands[f"conf{pct}_lo"] = preds[0.05] - adj
+                conf_bands[f"conf{pct}_hi"] = preds[0.95] + adj
             eta.end("predict")
             progress.update(
                 sub_done=len(Q_LIST) + 2,
