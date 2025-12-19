@@ -8,6 +8,7 @@ import hashlib
 import threading
 import concurrent.futures
 import re
+import math
 import numpy as np
 import pandas as pd
 import yaml
@@ -83,15 +84,14 @@ class ETATracker:
 def conformal_qhat(scores: np.ndarray, alpha: float, default: float = 0.0) -> float:
     """
     Finite-sample conformal quantile:
-      q = k-th order statistic where k = ceil((n+1)*(1-alpha))
-    Uses partition (O(n)) and clips at 0 so we never shrink bands.
+      q = k-th order statistic where k = ceil((n+1)*(1-alpha))/n.
+    Uses partition (O(n)).
     """
     v = scores[np.isfinite(scores)]
     if v.size == 0:
         return float(default)
-    v = np.maximum(0.0, v)
     n = int(v.size)
-    k = int(np.ceil((n + 1) * (1.0 - float(alpha))))  # 1..n+1
+    k = int(math.ceil((n + 1) * (1.0 - float(alpha))))  # 1..n+1
     k = min(max(k, 1), n)
     return float(np.partition(v, k - 1)[k - 1])
 
@@ -945,6 +945,12 @@ def main():
             EPS = 1e-6
             cal_sigma_fallback = np.maximum(EPS, 0.5 * (cal_q[0.90] - cal_q[0.10]))
             cal_sigma_rv = sigma_rv_arr[cal_idx]
+            te_sigma_rv = sigma_rv_arr[te_idx]
+
+            # Ensure we always have a regime proxy; fall back to realized vol if context proxies absent.
+            if cal_proxy is None or te_proxy is None:
+                cal_proxy = cal_sigma_rv
+                te_proxy = te_sigma_rv
 
             def pick_sigma(pred_sigma, rv_sigma, mode: str, eps: float = 1e-6):
                 pred_sigma = np.asarray(pred_sigma, dtype=np.float32)
@@ -1057,7 +1063,6 @@ def main():
             )
 
             te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
-            te_sigma_rv = sigma_rv_arr[te_idx]
             te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=sigma_proxy, eps=EPS)
             te_bucket = bucketize(te_proxy, edges, len(yte))
 
