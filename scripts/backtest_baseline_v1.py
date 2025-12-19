@@ -425,14 +425,22 @@ def split_indices_K(years_arr: np.ndarray, Y: int, cal_years: int):
     return tr, cal, te
 
 
-def safe_split_indices_K(years_arr: np.ndarray, Y: int, cal_years: int):
+def safe_split_indices_K(years_arr: np.ndarray, Y: int, cal_years: int, min_train_years: int = 5):
     min_year = int(years_arr.min())
-    max_possible_K = max(1, (Y - 1) - min_year)
+
+    # Cap by available history
+    max_K_by_data = max(1, (Y - 1) - min_year)
+
+    # Cap so train has at least min_train_years full years:
+    # need (Y - K) - min_year >= min_train_years => K <= Y - min_year - min_train_years
+    max_K_by_train = max(1, (Y - min_year) - int(min_train_years))
+
     K_req = max(1, int(cal_years))
-    K_use = min(K_req, max_possible_K)
+    K_use = min(K_req, max_K_by_data, max_K_by_train)
     if K_use != K_req:
         print(
-            f"[warn] Y={Y} requested cal_years={K_req} but only K={K_use} available from data; using K={K_use}.",
+            f"[warn] Y={Y} requested cal_years={K_req} but using K={K_use} "
+            f"(max_by_data={max_K_by_data}, max_by_train={max_K_by_train}, min_train_years={min_train_years}).",
             flush=True,
         )
     return split_indices_K(years_arr, Y, K_use), K_use
@@ -514,6 +522,12 @@ def parse_args():
         type=int,
         default=None,
         help="Optional rolling training window length in years (train < cal_start); default is expanding.",
+    )
+    p.add_argument(
+        "--min-train-years",
+        type=int,
+        default=5,
+        help="Minimum number of full years required in training; caps cal-years if needed.",
     )
     p.add_argument(
         "--n-buckets",
@@ -717,7 +731,9 @@ def main():
     # early years when sampling tickers with limited history.
     years_to_run = []
     for Y in candidate_years:
-        (tr_idx, cal_idx, te_idx), K_used = safe_split_indices_K(years_arr, Y, cal_years)
+        (tr_idx, cal_idx, te_idx), K_used = safe_split_indices_K(
+            years_arr, Y, cal_years, min_train_years=args.min_train_years
+        )
         if train_years is not None:
             cal_start = Y - K_used
             train_start = cal_start - train_years
