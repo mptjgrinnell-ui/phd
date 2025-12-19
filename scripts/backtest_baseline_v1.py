@@ -510,6 +510,12 @@ def parse_args():
         help="Calibration window length in years. For test year Y, calibrate on [Y-cal_years .. Y-1].",
     )
     p.add_argument(
+        "--train-years",
+        type=int,
+        default=None,
+        help="Optional rolling training window length in years (train < cal_start); default is expanding.",
+    )
+    p.add_argument(
         "--n-buckets",
         type=int,
         default=3,
@@ -684,6 +690,8 @@ def main():
                 flush=True,
             )
 
+    train_years = None if args.train_years is None else int(args.train_years)
+
     tape_rows = []
 
     candidate_years = list(make_year_slices(panel, first_test_year, last_test_year))
@@ -724,6 +732,10 @@ def main():
                 )
             else:
                 tr_idx, cal_idx, te_idx = split_indices_K(years_arr, Y, cal_years)
+
+            if train_years is not None:
+                train_start = cal_year_start - train_years
+                tr_idx = np.flatnonzero((years_arr >= train_start) & (years_arr < cal_year_start))
 
             progress.update(rows_tr=len(tr_idx), rows_cal=len(cal_idx), rows_te=len(te_idx), cum_test_rows=cum_test_rows)
             if len(tr_idx) < 10000 or len(cal_idx) < 1000 or len(te_idx) < 1000:
