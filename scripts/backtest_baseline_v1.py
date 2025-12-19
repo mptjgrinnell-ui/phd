@@ -695,7 +695,11 @@ def main():
     last_test_year = (
         int(args.last_test_year)
         if args.last_test_year is not None
-        else int(bcfg["walk_forward"]["last_test_year"])
+        else (
+            int(bcfg["walk_forward"]["last_test_year"])
+            if bcfg["walk_forward"]["last_test_year"] is not None
+            else None
+        )
     )
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
