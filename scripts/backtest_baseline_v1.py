@@ -518,20 +518,20 @@ def parse_args():
     p.add_argument(
         "--n-buckets",
         type=int,
-        default=3,
-        help="Mondrian bucket count for conformal conditioning (default 3; try 5).",
+        default=None,
+        help="(Alias) Mondrian bucket count for conformal conditioning. If unset, read from config.",
     )
     p.add_argument(
         "--regime-buckets",
         type=int,
         default=None,
-        help="Number of Mondrian regime buckets for conformal (e.g., 5).",
+        help="Number of Mondrian regime buckets for conformal (e.g., 5). If unset, read from config.",
     )
     p.add_argument(
         "--sigma-proxy",
         choices=["pred", "rv", "hybrid"],
-        default="pred",
-        help="Sigma for conformal normalization: pred=(q90-q10)/2, rv=EWMA realized vol, hybrid=max(pred,rv).",
+        default=None,
+        help="Sigma for conformal normalization. If unset, read from config.",
     )
     p.add_argument(
         "--first-test-year",
@@ -634,12 +634,28 @@ def main():
             X_all = X_all[:, keep_mask]
             print(f"Dropped {dropped} constant cols; remaining={len(feat_cols)}")
 
-    cal_years = int(args.cal_years) if args.cal_years is not None else int(bcfg["walk_forward"].get("cal_years", 1))
+    wf_cfg = bcfg.get("walk_forward", {})
+    conformal_cfg = bcfg.get("conformal", {})
+    cal_years = (
+        int(args.cal_years)
+        if args.cal_years is not None
+        else int(wf_cfg.get("cal_years", wf_cfg.get("calibration_years", 1)))
+    )
     n_buckets = (
         int(args.regime_buckets)
         if args.regime_buckets is not None
-        else int(bcfg.get("conformal", {}).get("n_buckets", 3))
+        else (
+            int(args.n_buckets)
+            if args.n_buckets is not None
+            else int(conformal_cfg.get("n_buckets", 3))
+        )
     )
+    sigma_proxy = (
+        str(args.sigma_proxy)
+        if args.sigma_proxy is not None
+        else str(conformal_cfg.get("sigma_proxy", "pred"))
+    )
+    train_years = None if args.train_years is None else int(args.train_years)
     if cal_years < 1:
         raise ValueError("--cal-years must be >= 1")
     if n_buckets < 2:
@@ -684,14 +700,11 @@ def main():
     if last_test_year is not None and first_test_year > last_test_year:
         raise ValueError(f"first_test_year ({first_test_year}) > last_test_year ({last_test_year})")
     if args.min_panel_year is not None and args.cal_years is not None:
-        if int(args.min_panel_year) >= (first_test_year - int(args.cal_years)):
+        if int(args.min_panel_year) >= (first_test_year - int(cal_years)):
             print(
                 "[warning] min-panel-year is too late for the requested cal-years; training may be empty.",
                 flush=True,
             )
-
-    train_years = None if args.train_years is None else int(args.train_years)
-
     tape_rows = []
 
     candidate_years = list(make_year_slices(panel, first_test_year, last_test_year))
@@ -701,8 +714,13 @@ def main():
     years_to_run = []
     for Y in candidate_years:
         (tr_idx, cal_idx, te_idx), K_used = safe_split_indices_K(years_arr, Y, cal_years)
+        if train_years is not None:
+            cal_start = Y - K_used
+            train_start = cal_start - train_years
+            tr_idx = np.flatnonzero((years_arr >= train_start) & (years_arr < cal_start))
+
         if len(tr_idx) >= MIN_TRAIN_ROWS and len(cal_idx) >= MIN_CAL_ROWS and len(te_idx) >= MIN_TEST_ROWS:
-            years_to_run.append(Y)
+            years_to_run.append((Y, K_used))
 
     if max_years is not None:
         years_to_run = years_to_run[: int(max_years)]
@@ -719,19 +737,19 @@ def main():
             progress.update(phase="no_valid_years")
             print("No valid walk-forward slices produced; check data coverage.", flush=True)
             return
-        for i, Y in enumerate(years_to_run, start=1):
-            cal_year_start = Y - cal_years
+        for i, (Y, K_used) in enumerate(years_to_run, start=1):
+            cal_year_start = Y - K_used
             cal_year_end = Y - 1
             test_year = Y
             progress.update(i=i, year=Y, phase="split")
 
             if args.cache_splits:
-                split_cache_dir = os.path.join(SPLIT_CACHE_DIR, split_sig)
+                split_cache_dir = os.path.join(SPLIT_CACHE_DIR, split_sig, f"K{K_used}")
                 tr_idx, cal_idx, te_idx = load_or_make_split_indices(
-                    years_arr, Y, cal_years=cal_years, cache_dir=split_cache_dir
+                    years_arr, Y, cal_years=K_used, cache_dir=split_cache_dir
                 )
             else:
-                tr_idx, cal_idx, te_idx = split_indices_K(years_arr, Y, cal_years)
+                tr_idx, cal_idx, te_idx = split_indices_K(years_arr, Y, K_used)
 
             if train_years is not None:
                 train_start = cal_year_start - train_years
@@ -920,7 +938,7 @@ def main():
                 s = np.where(np.isnan(s), pred_sigma, s)
                 return np.maximum(eps, s)
 
-            cal_sigma = pick_sigma(cal_sigma_fallback, cal_sigma_rv, mode=args.sigma_proxy, eps=EPS)
+            cal_sigma = pick_sigma(cal_sigma_fallback, cal_sigma_rv, mode=sigma_proxy, eps=EPS)
 
             # Two-sided CQR normalized nonconformity score (single score).
             # This avoids the "mass at 0 => qhat=0" failure mode from split tails.
@@ -1020,7 +1038,7 @@ def main():
 
             te_sigma_fallback = np.maximum(EPS, 0.5 * (preds[0.90] - preds[0.10]))
             te_sigma_rv = sigma_rv_arr[te_idx]
-            te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=args.sigma_proxy, eps=EPS)
+            te_sigma = pick_sigma(te_sigma_fallback, te_sigma_rv, mode=sigma_proxy, eps=EPS)
             te_bucket = bucketize(te_proxy, edges, len(yte))
 
             conf_bands = {}
